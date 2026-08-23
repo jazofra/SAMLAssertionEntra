@@ -307,6 +307,37 @@ def fetch_tenant_id(client: GraphClient) -> str | None:
         return None
 
 
+def load_dump(path: str) -> tuple[list[dict], list[dict], str | None, set[str]]:
+    """Load service principals and application registrations from a pre-exported
+    JSON file so the analysis can run offline, with no tenant credentials.
+
+    Accepted shapes:
+      * {"servicePrincipals": [...], "applications": [...],
+         "tenantId": "...", "verifiedDomains": ["contoso.com", ...]}
+      * a `findings.json` previously written by this tool: the raw SP/app arrays
+        are not stored there, so only the two top-level arrays above are read.
+
+    Each array element is the raw Microsoft Graph object, exactly as returned by
+    GET /servicePrincipals and GET /applications. Export them however you like,
+    e.g. `az rest` or Graph Explorer piped into a JSON file.
+    """
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        sys.exit(f"[!] {path}: expected a JSON object with 'servicePrincipals'/'applications' keys")
+    sps = data.get("servicePrincipals") or data.get("service_principals") or []
+    apps = data.get("applications") or data.get("apps") or []
+    if not isinstance(sps, list) or not isinstance(apps, list):
+        sys.exit(f"[!] {path}: 'servicePrincipals' and 'applications' must be JSON arrays")
+    tenant_id = data.get("tenantId") or data.get("tenant_id")
+    domains = {
+        d.strip().lower()
+        for d in (data.get("verifiedDomains") or data.get("ownedDomains") or [])
+        if isinstance(d, str) and d.strip()
+    }
+    return sps, apps, tenant_id, domains
+
+
 # ---------------------------------------------------------------------------
 # URL analysis
 # ---------------------------------------------------------------------------
@@ -327,6 +358,41 @@ def registrable_match(host: str, owned: set[str]) -> bool:
     return any(host == d or host.endswith("." + d) for d in owned)
 
 
+def normalise_for_match(raw: str) -> str:
+    """Canonical (scheme://host:port/path) form used to compare a candidate ACS
+    URL against a registered reply URL. Host is lowercased and the default port
+    for the scheme is filled in, mirroring how Entra normalises before its
+    exact-match reply-URL check. Path is left byte-for-byte: Entra treats the
+    path as case-sensitive."""
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return raw.strip()
+    scheme = (parts.scheme or "").lower()
+    host = (parts.hostname or "").lower()
+    port = parts.port
+    if port is None:
+        port = {"https": 443, "http": 80}.get(scheme)
+    path = parts.path or "/"
+    return f"{scheme}://{host}:{port}{path}"
+
+
+def acs_candidate_match(registered: str, candidate: str) -> str | None:
+    """Would an AuthnRequest carrying `candidate` as AssertionConsumerServiceURL
+    be honoured against this `registered` reply URL? Returns "exact", "wildcard",
+    or None. This models the only requestor check Entra performs on an unsigned
+    request: exact match against the reply-URL allowlist (AADSTS50011 otherwise).
+    A wildcard registered URL is expanded permissively because, once present, it
+    collapses the allowlist regardless of what the attacker supplies."""
+    if "*" in registered:
+        pattern = "^" + re.escape(registered).replace(r"\*", ".*") + "$"
+        if re.match(pattern, candidate) or re.match(pattern, normalise_for_match(candidate)):
+            return "wildcard"
+    if registered == candidate or normalise_for_match(registered) == normalise_for_match(candidate):
+        return "exact"
+    return None
+
+
 def takeover_suffix(host: str) -> str | None:
     for suf in TAKEOVER_SUFFIXES:
         if host == suf or host.endswith("." + suf):
@@ -342,9 +408,33 @@ def is_private_host(host: str) -> bool:
     return ip.is_private or ip.is_loopback or ip.is_link_local
 
 
-def analyse_url(rec: UrlRecord, owned_domains: set[str], saml_capable: bool) -> None:
+def analyse_url(
+    rec: UrlRecord,
+    owned_domains: set[str],
+    saml_capable: bool,
+    acs_candidates: list[str] | None = None,
+) -> None:
     raw = rec.url
     loopback = rec.host in ("localhost",) or is_private_host(rec.host)
+
+    # If the operator supplied the ACS URL(s) an attacker would try to inject
+    # (e.g. the one from a bug-bounty report), flag every app whose allowlist
+    # would actually deliver an assertion there. This is the concrete answer to
+    # "which of my apps are affected by this specific URL?".
+    for cand in acs_candidates or []:
+        match = acs_candidate_match(raw, cand)
+        if match == "exact":
+            rec.findings.append(
+                Finding("CRITICAL", "ACS_URL_ACCEPTED",
+                        f"Injected ACS URL '{cand}' matches this registered reply URL - Entra "
+                        "would deliver the victim's signed assertion here, no AADSTS50011")
+            )
+        elif match == "wildcard":
+            rec.findings.append(
+                Finding("CRITICAL", "ACS_URL_ACCEPTED_VIA_WILDCARD",
+                        f"Injected ACS URL '{cand}' is covered by this wildcard reply URL - Entra "
+                        "would deliver the victim's signed assertion here")
+            )
 
     if "*" in raw:
         rec.findings.append(
@@ -495,6 +585,8 @@ def build_records(
     owned_domains: set[str],
     tenant_id: str | None,
     include_all: bool,
+    acs_candidates: list[str] | None = None,
+    saml_only: bool = False,
 ) -> list[AppRecord]:
     by_app_id: dict[str, AppRecord] = {}
     app_index = {a["appId"]: a for a in apps if a.get("appId")}
@@ -557,7 +649,7 @@ def build_records(
 
     for rec in records:
         for u in rec.urls:
-            analyse_url(u, owned_domains, rec.saml_capable)
+            analyse_url(u, owned_domains, rec.saml_capable, acs_candidates)
 
         if rec.saml_capable:
             if rec.signed_requests_required is not True:
@@ -594,6 +686,9 @@ def build_records(
                         "App is owned by another tenant; signed-request enforcement and reply "
                         "URL hygiene are the vendor's responsibility - verify contractually")
             )
+
+    if saml_only:
+        records = [r for r in records if r.saml_capable]
 
     if not include_all:
         records = [r for r in records if r.findings or any(u.findings for u in r.urls)]
@@ -699,7 +794,15 @@ def main() -> int:
         description="Audit Entra ID reply URLs / SAML ACS allowlists for assertion-hijack exposure.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--tenant", required=True, help="tenant ID or domain")
+    p.add_argument("--tenant", help="tenant ID or domain (required unless --from-dump)")
+    p.add_argument("--from-dump", help="analyse a pre-exported Graph JSON file offline "
+                                       "(no credentials, no network); see load_dump() for the shape")
+    p.add_argument("--check-acs-url", action="append", metavar="URL",
+                   help="candidate injected ACS URL(s) to test against every app's reply-URL "
+                        "allowlist; repeatable and/or comma-separated. Apps that would accept "
+                        "delivery are flagged CRITICAL (ACS_URL_ACCEPTED)")
+    p.add_argument("--saml-only", action="store_true",
+                   help="restrict the report to SAML-capable apps")
     p.add_argument("--client-id", help="app registration client ID")
     p.add_argument("--client-secret", help="client secret (app-only flow)")
     p.add_argument("--device-code", action="store_true", help="interactive device code flow")
@@ -717,29 +820,51 @@ def main() -> int:
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
 
-    token = acquire_token(args)
-    client = GraphClient(token, verbose=args.verbose)
+    if not args.from_dump and not args.tenant:
+        p.error("--tenant is required unless --from-dump is given")
 
-    if args.verbose:
-        print("[*] enumerating service principals", file=sys.stderr)
-    sps = fetch_service_principals(client)
-    if args.verbose:
-        print(f"[*] {len(sps)} service principals", file=sys.stderr)
-        print("[*] enumerating application registrations", file=sys.stderr)
-    apps = fetch_applications(client)
-    if args.verbose:
-        print(f"[*] {len(apps)} applications", file=sys.stderr)
+    # Candidate ACS URLs may be repeated and/or comma-separated.
+    acs_candidates: list[str] = []
+    for chunk in args.check_acs_url or []:
+        acs_candidates.extend(c.strip() for c in chunk.split(",") if c.strip())
 
-    tenant_id = fetch_tenant_id(client)
+    dump_domains: set[str] = set()
+    if args.from_dump:
+        sps, apps, tenant_id, dump_domains = load_dump(args.from_dump)
+        if args.verbose:
+            print(f"[*] loaded {len(sps)} service principals, {len(apps)} applications "
+                  f"from {args.from_dump}", file=sys.stderr)
+    else:
+        token = acquire_token(args)
+        client = GraphClient(token, verbose=args.verbose)
+
+        if args.verbose:
+            print("[*] enumerating service principals", file=sys.stderr)
+        sps = fetch_service_principals(client)
+        if args.verbose:
+            print(f"[*] {len(sps)} service principals", file=sys.stderr)
+            print("[*] enumerating application registrations", file=sys.stderr)
+        apps = fetch_applications(client)
+        if args.verbose:
+            print(f"[*] {len(apps)} applications", file=sys.stderr)
+
+        tenant_id = fetch_tenant_id(client)
 
     if args.owned_domains:
         owned = {d.strip().lower() for d in args.owned_domains.split(",") if d.strip()}
+    elif args.from_dump:
+        owned = dump_domains
+        if args.verbose:
+            print(f"[*] {len(owned)} verified domains from dump", file=sys.stderr)
     else:
         owned = fetch_verified_domains(client)
         if args.verbose:
             print(f"[*] {len(owned)} verified tenant domains", file=sys.stderr)
 
-    records = build_records(sps, apps, owned, tenant_id, args.include_clean)
+    records = build_records(
+        sps, apps, owned, tenant_id, args.include_clean,
+        acs_candidates=acs_candidates, saml_only=args.saml_only,
+    )
 
     if not args.skip_dns:
         run_dns_checks(records, args.dns_workers, args.verbose)
@@ -752,13 +877,34 @@ def main() -> int:
     rows = flatten(records)
     print_console(records, rows, args.quiet_info)
 
+    if acs_candidates:
+        accepted = sorted(
+            {r.display_name for r in records
+             for f in (r.findings + [f for u in r.urls for f in u.findings])
+             if f.code in ("ACS_URL_ACCEPTED", "ACS_URL_ACCEPTED_VIA_WILDCARD")}
+        )
+        print(f"=== injected ACS URL check ({len(acs_candidates)} URL(s)) ===")
+        for c in acs_candidates:
+            print(f"    tested: {c}")
+        if accepted:
+            print(f"[!] {len(accepted)} app(s) would ACCEPT delivery to a tested URL:")
+            for name in accepted:
+                print(f"      - {name}")
+        else:
+            print("[+] No app's reply-URL allowlist would accept any tested URL "
+                  "(Entra would return AADSTS50011).")
+        print()
+
     meta = {
         "generatedAt": datetime.now(timezone.utc).isoformat(),
         "tenant": args.tenant,
         "tenantId": tenant_id,
+        "source": f"dump:{args.from_dump}" if args.from_dump else "graph",
         "servicePrincipalCount": len(sps),
         "applicationCount": len(apps),
         "ownedDomains": sorted(owned),
+        "checkedAcsUrls": acs_candidates,
+        "samlOnly": args.saml_only,
         "dnsChecked": not args.skip_dns,
         "dnspythonAvailable": HAVE_DNSPYTHON,
     }

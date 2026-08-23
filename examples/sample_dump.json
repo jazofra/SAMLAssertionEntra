@@ -1,0 +1,49 @@
+{
+  "_comment": "Example offline dump for `python acs_audit.py --from-dump examples/sample_dump.json`. Each element under servicePrincipals/applications is a raw Microsoft Graph object as returned by GET /servicePrincipals and GET /applications. Every value here is fictional. It mirrors a two-SP Shibboleth SAML scenario whose Entra apps do not require signed AuthnRequests.",
+  "tenantId": "11111111-1111-1111-1111-111111111111",
+  "verifiedDomains": ["example.com"],
+  "servicePrincipals": [
+    {
+      "id": "sp-portal-dev",
+      "appId": "app-portal-dev",
+      "displayName": "Portal (dev)",
+      "preferredSingleSignOnMode": "saml",
+      "accountEnabled": true,
+      "appOwnerOrganizationId": "11111111-1111-1111-1111-111111111111",
+      "tags": ["WindowsAzureActiveDirectoryCustomSingleSignOnApplication"],
+      "replyUrls": [
+        "https://sp-dev.example.com/portal/Shibboleth.sso/SAML2/POST"
+      ]
+    },
+    {
+      "id": "sp-portal-prod",
+      "appId": "app-portal-prod",
+      "displayName": "Portal (production)",
+      "preferredSingleSignOnMode": "saml",
+      "accountEnabled": true,
+      "appOwnerOrganizationId": "11111111-1111-1111-1111-111111111111",
+      "tags": ["WindowsAzureActiveDirectoryCustomSingleSignOnApplication"],
+      "replyUrls": [
+        "https://sp.example.com/portal/Shibboleth.sso/SAML2/POST"
+      ]
+    }
+  ],
+  "applications": [
+    {
+      "id": "a-portal-dev",
+      "appId": "app-portal-dev",
+      "displayName": "Portal (dev)",
+      "requestSignatureVerification": {"isSignedRequestRequired": false},
+      "keyCredentials": [],
+      "web": {"redirectUris": []}
+    },
+    {
+      "id": "a-portal-prod",
+      "appId": "app-portal-prod",
+      "displayName": "Portal (production)",
+      "requestSignatureVerification": {"isSignedRequestRequired": false},
+      "keyCredentials": [],
+      "web": {"redirectUris": []}
+    }
+  ]
+}

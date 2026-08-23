@@ -6,22 +6,28 @@
 
 import sys
 
-from acs_audit import build_records, flatten, print_console
+from acs_audit import (
+    acs_candidate_match,
+    build_records,
+    flatten,
+    normalise_for_match,
+    print_console,
+)
 
 TENANT_ID = "11111111-1111-1111-1111-111111111111"
 OWNED = {"contoso.com", "contoso.onmicrosoft.com"}
 
 SPS = [
     {   # SAML app, unsigned requests, one dangling-looking host, one wildcard
-        "id": "sp-1", "appId": "app-1", "displayName": "ROSS Portal",
+        "id": "sp-1", "appId": "app-1", "displayName": "Acme Portal",
         "preferredSingleSignOnMode": "saml", "accountEnabled": True,
         "appOwnerOrganizationId": TENANT_ID,
         "tags": ["WindowsAzureActiveDirectoryCustomSingleSignOnApplication"],
         "replyUrls": [
-            "https://ross.contoso.com/portal/Shibboleth.sso/SAML2/POST",
-            "https://ross-legacy.azurewebsites.net/Shibboleth.sso/SAML2/POST",
+            "https://sp.contoso.com/portal/Shibboleth.sso/SAML2/POST",
+            "https://legacy-sp.azurewebsites.net/Shibboleth.sso/SAML2/POST",
             "https://*.dev.contoso.com/saml/acs",
-            "http://ross-old.contoso.com/saml/acs",
+            "http://old-sp.contoso.com/saml/acs",
         ],
     },
     {   # SAML app with signing enforced - should be much quieter
@@ -50,7 +56,7 @@ SPS = [
 ]
 
 APPS = [
-    {"id": "a-1", "appId": "app-1", "displayName": "ROSS Portal",
+    {"id": "a-1", "appId": "app-1", "displayName": "Acme Portal",
      "requestSignatureVerification": {"isSignedRequestRequired": False},
      "keyCredentials": [], "web": {"redirectUris": []}},
     {"id": "a-2", "appId": "app-2", "displayName": "Finance SAML",
@@ -65,6 +71,82 @@ APPS = [
                               "http://localhost:5001/signin-oidc"]},
      "spa": {"redirectUris": ["https://legacy-spa.herokuapp.com/callback"]}},
 ]
+
+
+def test_match_helpers() -> bool:
+    ok = True
+
+    # Exact match after normalisation (default port filled in, host lowercased).
+    if acs_candidate_match(
+        "https://sp.contoso.com/portal/Shibboleth.sso/SAML2/POST",
+        "https://SP.contoso.com:443/portal/Shibboleth.sso/SAML2/POST",
+    ) != "exact":
+        print("FAIL - normalised exact match not detected")
+        ok = False
+
+    # A brand-new attacker URL matches nothing (Entra would return AADSTS50011).
+    if acs_candidate_match(
+        "https://sp.contoso.com/portal/Shibboleth.sso/SAML2/POST",
+        "https://attacker.oast.me/saml/acs",
+    ) is not None:
+        print("FAIL - unrelated attacker URL should not match a real reply URL")
+        ok = False
+
+    # A wildcard reply URL swallows anything under it.
+    if acs_candidate_match(
+        "https://*.dev.contoso.com/saml/acs",
+        "https://attacker.dev.contoso.com/saml/acs",
+    ) != "wildcard":
+        print("FAIL - wildcard reply URL did not match candidate under it")
+        ok = False
+
+    if normalise_for_match("https://Host.Example/") != "https://host.example:443/":
+        print("FAIL - normalise_for_match did not canonicalise host/port/path")
+        ok = False
+
+    return ok
+
+
+def test_acs_url_check() -> bool:
+    ok = True
+
+    # The exact SP reply URL is registered on app-1; supplying it as the
+    # injected ACS URL must flag app-1 as ACCEPTED, and the wildcard on app-1
+    # must also accept a host beneath *.dev.contoso.com.
+    records = build_records(
+        SPS, APPS, OWNED, TENANT_ID, include_all=False,
+        acs_candidates=[
+            "https://sp.contoso.com/portal/Shibboleth.sso/SAML2/POST",
+            "https://evil.dev.contoso.com/saml/acs",
+            "https://attacker.oast.me/saml/acs",
+        ],
+    )
+    rows = flatten(records)
+    codes = {c for r in rows for c in r["codes"].split(";") if c}
+    if "ACS_URL_ACCEPTED" not in codes:
+        print("FAIL - exact injected ACS URL was not flagged as accepted")
+        ok = False
+    if "ACS_URL_ACCEPTED_VIA_WILDCARD" not in codes:
+        print("FAIL - wildcard-covered injected ACS URL was not flagged")
+        ok = False
+
+    accepting_apps = {
+        r["app"] for r in rows
+        if "ACS_URL_ACCEPTED" in r["codes"] or "ACS_URL_ACCEPTED_VIA_WILDCARD" in r["codes"]
+    }
+    if accepting_apps != {"Acme Portal"}:
+        print(f"FAIL - unexpected apps accepted the injected URL: {accepting_apps}")
+        ok = False
+
+    return ok
+
+
+def test_saml_only() -> bool:
+    records = build_records(SPS, APPS, OWNED, TENANT_ID, include_all=True, saml_only=True)
+    if any(not r.saml_capable for r in records):
+        print("FAIL - --saml-only leaked a non-SAML app")
+        return False
+    return True
 
 
 def main() -> int:
@@ -94,11 +176,19 @@ def main() -> int:
         return 1
 
     critical_apps = {r["app"] for r in rows if r["severity"] == "CRITICAL"}
-    if "ROSS Portal" not in critical_apps:
+    if "Acme Portal" not in critical_apps:
         print("FAIL - wildcard reply URL did not escalate to CRITICAL")
         return 1
 
+    if not test_match_helpers():
+        return 1
+    if not test_acs_url_check():
+        return 1
+    if not test_saml_only():
+        return 1
+
     print("PASS - all expected detections fired, hardened app is clean")
+    print("PASS - injected ACS URL check, wildcard match, and --saml-only behave correctly")
     return 0
 
 

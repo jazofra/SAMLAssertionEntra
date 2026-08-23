@@ -44,20 +44,88 @@ Required Graph permissions, both read-only: `Application.Read.All`, `Directory.R
 
 The tool issues `GET` requests only. It never writes to the directory.
 
+### Answering a specific report: "which of my apps would accept this URL?"
+
+When a report hands you the injected ACS URL an attacker used (e.g.
+`https://attacker.oast.me/saml/acs`), pass it with `--check-acs-url` to test it
+against every app's reply-URL allowlist — the exact-match check Entra actually
+performs after authentication. The flag is repeatable and accepts
+comma-separated values. Any app that would deliver an assertion to that URL is
+flagged `ACS_URL_ACCEPTED` (CRITICAL); if nothing matches, Entra would return
+`AADSTS50011` and the tool says so.
+
+```bash
+python acs_audit.py --tenant <tenant-id> --device-code \
+  --check-acs-url "https://attacker.oast.me/saml/acs" \
+  --check-acs-url "https://sp.example.com/portal/Shibboleth.sso/SAML2/POST"
+```
+
+Add `--saml-only` to restrict the whole report to SAML-capable apps.
+
+### Running offline, without tenant credentials
+
+If you cannot get an app registration or a delegated token, export the two
+Graph collections to a JSON file and analyse them with `--from-dump` — no
+network and no credentials are needed (add `--skip-dns` to stay fully offline).
+A worked example is in [`examples/sample_dump.json`](examples/sample_dump.json),
+which mirrors a two-SP Shibboleth SAML scenario using fictional hosts:
+
+```bash
+python acs_audit.py --from-dump examples/sample_dump.json --skip-dns \
+  --check-acs-url "https://sp.example.com/portal/Shibboleth.sso/SAML2/POST"
+```
+
+The dump is a JSON object with two arrays of **raw** Graph objects:
+
+```jsonc
+{
+  "tenantId": "<optional>",
+  "verifiedDomains": ["contoso.com"],          // optional ownership baseline
+  "servicePrincipals": [ /* GET /servicePrincipals value[] */ ],
+  "applications":      [ /* GET /applications value[] */ ]
+}
+```
+
+Export them however you like, for example with the Azure CLI:
+
+```bash
+python - <<'PY' > dump.json
+import json, subprocess
+def graph(path):
+    out = subprocess.check_output(["az", "rest", "--method", "get", "--url",
+        "https://graph.microsoft.com/v1.0" + path])
+    return json.loads(out)["value"]
+json.dump({
+    "servicePrincipals": graph("/servicePrincipals?$select=id,appId,displayName,replyUrls,"
+        "preferredSingleSignOnMode,accountEnabled,servicePrincipalType,appOwnerOrganizationId,tags&$top=999"),
+    "applications": graph("/applications?$select=id,appId,displayName,web,spa,publicClient,"
+        "keyCredentials,identifierUris,signInAudience,requestSignatureVerification&$top=999"),
+}, __import__("sys").stdout, indent=2)
+PY
+python acs_audit.py --from-dump dump.json
+```
+
 ### Useful flags
 
 | Flag | Effect |
 |---|---|
+| `--check-acs-url URL` | Test an injected ACS URL against every app's allowlist; repeatable and comma-separated. Matches are flagged `ACS_URL_ACCEPTED` (CRITICAL) |
+| `--from-dump FILE` | Analyse a pre-exported Graph JSON offline; no tenant, no credentials |
+| `--saml-only` | Restrict the report to SAML-capable apps |
 | `--owned-domains a.com,b.com` | Override the ownership baseline; defaults to the tenant's verified domains |
 | `--skip-dns` | Skip resolution (fast pass, or for air-gapped/egress-restricted runs) |
 | `--include-clean` | Emit apps with no findings, for full inventory |
 | `--quiet-info` | Suppress LOW/INFO in console output |
 | `--fail-on SEVERITY` | Exit 2 if anything at or above that severity is found |
 
+Either `--tenant` or `--from-dump` is required.
+
 ## Findings
 
 | Code | Severity | Meaning |
 |---|---|---|
+| `ACS_URL_ACCEPTED` | CRITICAL | A `--check-acs-url` candidate exactly matches a registered reply URL. Entra would deliver the assertion there — this app is affected by that specific URL. |
+| `ACS_URL_ACCEPTED_VIA_WILDCARD` | CRITICAL | A `--check-acs-url` candidate is covered by a wildcard reply URL. |
 | `DANGLING_DNS` | CRITICAL | Registered reply URL host does not resolve. Whoever claims the name receives assertions for this app. |
 | `WILDCARD_REPLY_URL` | CRITICAL | Wildcard in the reply URL — the exact-match allowlist no longer constrains delivery. |
 | `CNAME_TO_CLAIMABLE_SERVICE` | HIGH | CNAME chain terminates in a takeover-prone namespace. |
