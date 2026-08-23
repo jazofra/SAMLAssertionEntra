@@ -117,8 +117,35 @@ python acs_audit.py --from-dump dump.json
 | `--include-clean` | Emit apps with no findings, for full inventory |
 | `--quiet-info` | Suppress LOW/INFO in console output |
 | `--fail-on SEVERITY` | Exit 2 if anything at or above that severity is found |
+| `--proxy URL` | Route Graph calls through an HTTP(S) proxy (overrides `HTTPS_PROXY`) |
+| `--ca-bundle PATH` | Trust this CA bundle, for proxies that do TLS inspection (overrides `REQUESTS_CA_BUNDLE`) |
 
 Either `--tenant` or `--from-dump` is required.
+
+### Behind a corporate proxy / firewall
+
+If authentication succeeds but the first Graph call dies with
+`RemoteDisconnected` / `Connection aborted`, a proxy, firewall or TLS-inspection
+appliance is between you and `graph.microsoft.com`. The tool now retries
+transport errors with backoff and, on exhaustion, prints an actionable message
+instead of a traceback. To get through:
+
+```powershell
+# PowerShell — point the tool (and MSAL) at your proxy
+$env:HTTPS_PROXY = "http://your-proxy:8080"
+# If the proxy re-signs TLS, trust its root CA (export it as a PEM first):
+$env:REQUESTS_CA_BUNDLE = "C:\path\to\corp-root-ca.pem"
+python .\acs_audit.py --tenant <tenant-id> --client-id <id> --client-secret <secret>
+
+# …or pass them explicitly instead of env vars:
+python .\acs_audit.py --tenant <tenant-id> --client-id <id> --client-secret <secret> `
+  --proxy "http://your-proxy:8080" --ca-bundle "C:\path\to\corp-root-ca.pem"
+```
+
+Do not disable TLS verification to work around inspection — trust the proxy's CA
+instead. If Graph stays blocked, run from a host with the same egress as your
+users, or export the two collections elsewhere and analyse them with
+`--from-dump`.
 
 ## Findings
 

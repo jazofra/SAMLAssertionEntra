@@ -126,7 +126,14 @@ SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
 # Graph client
 # ---------------------------------------------------------------------------
 class GraphClient:
-    def __init__(self, token: str, timeout: int = 60, verbose: bool = False):
+    def __init__(
+        self,
+        token: str,
+        timeout: int = 60,
+        verbose: bool = False,
+        proxy: str | None = None,
+        ca_bundle: str | None = None,
+    ):
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -136,12 +143,43 @@ class GraphClient:
                 "User-Agent": "acs-audit/1.0",
             }
         )
+        # requests honours HTTP(S)_PROXY / NO_PROXY and REQUESTS_CA_BUNDLE from the
+        # environment by default; an explicit flag overrides that for this run.
+        if proxy:
+            self.session.proxies.update({"http": proxy, "https": proxy})
+        if ca_bundle:
+            self.session.verify = ca_bundle
         self.timeout = timeout
         self.verbose = verbose
 
     def get(self, url: str, params: dict | None = None) -> dict:
+        resp = None
         for attempt in range(6):
-            resp = self.session.get(url, params=params, timeout=self.timeout)
+            try:
+                resp = self.session.get(url, params=params, timeout=self.timeout)
+            except (requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout,
+                    requests.exceptions.ChunkedEncodingError) as exc:
+                # Transport-level failure (connection reset/closed, DNS, read
+                # timeout). Common behind a corporate proxy / TLS inspection or a
+                # firewall that blocks graph.microsoft.com. Back off and retry
+                # rather than crashing with a raw traceback.
+                if attempt == 5:
+                    raise GraphError(
+                        0,
+                        f"connection to Graph failed after 6 attempts ({type(exc).__name__}: "
+                        f"{exc}). If auth succeeded but this call did not, a proxy/firewall or "
+                        f"TLS inspection is likely blocking {GRAPH}. Set HTTPS_PROXY (or --proxy) "
+                        f"and, for TLS interception, REQUESTS_CA_BUNDLE (or --ca-bundle).",
+                        url,
+                    ) from exc
+                wait = min(2**attempt, 30)
+                if self.verbose:
+                    print(f"[!] {type(exc).__name__} talking to Graph, retrying in {wait}s "
+                          f"(attempt {attempt + 1}/6)", file=sys.stderr)
+                time.sleep(wait)
+                continue
+
             if resp.status_code == 429 or resp.status_code >= 500:
                 wait = int(resp.headers.get("Retry-After", min(2**attempt, 30)))
                 if self.verbose:
@@ -151,7 +189,8 @@ class GraphClient:
             if not resp.ok:
                 raise GraphError(resp.status_code, resp.text[:1000], url)
             return resp.json()
-        raise GraphError(resp.status_code, "retries exhausted", url)
+        status = resp.status_code if resp is not None else 0
+        raise GraphError(status, "retries exhausted", url)
 
     def paged(self, path: str, params: dict | None = None) -> Iterable[dict]:
         url = f"{GRAPH}{path}"
@@ -817,6 +856,10 @@ def main() -> int:
     p.add_argument("--out-csv", help="write flattened findings to this CSV path")
     p.add_argument("--fail-on", choices=["CRITICAL", "HIGH", "MEDIUM", "LOW"],
                    help="exit non-zero if any finding at or above this severity (for CI)")
+    p.add_argument("--proxy", help="HTTP(S) proxy URL for Graph calls, e.g. http://proxy:8080 "
+                                   "(overrides HTTPS_PROXY for this run)")
+    p.add_argument("--ca-bundle", help="path to a CA bundle to trust, for proxies that perform "
+                                       "TLS inspection (overrides REQUESTS_CA_BUNDLE)")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
 
@@ -836,7 +879,8 @@ def main() -> int:
                   f"from {args.from_dump}", file=sys.stderr)
     else:
         token = acquire_token(args)
-        client = GraphClient(token, verbose=args.verbose)
+        client = GraphClient(token, verbose=args.verbose,
+                             proxy=args.proxy, ca_bundle=args.ca_bundle)
 
         if args.verbose:
             print("[*] enumerating service principals", file=sys.stderr)
