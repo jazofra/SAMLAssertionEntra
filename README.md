@@ -1,0 +1,108 @@
+# entra-acs-audit
+
+Read-only audit of Entra ID reply URLs and SAML ACS allowlists, looking for conditions that let an attacker receive a SAML assertion or OAuth authorization code intended for someone else.
+
+## Why this exists
+
+Entra ID does not validate AuthnRequest signatures unless *Require verification certificates* is enabled on the application. Requestor verification is provided **solely** by the reply URL allowlist: Entra honours the `AssertionConsumerServiceURL` sent in an AuthnRequest as long as it exactly matches a registered reply URL, and returns `AADSTS50011` otherwise. That check happens *after* the user has authenticated.
+
+Two things follow:
+
+1. `AuthnRequestsSigned="false"` on the SP is, by itself, not exploitable against Entra. Reports demonstrating that "the login page rendered with no error" and that the injected URL appears in `sCtx` prove nothing — that is expected behaviour, and validation has not run yet.
+2. The allowlist is only as strong as your control over every host on it. A registered reply URL whose DNS is dangling, or whose host lives in a claimable third-party namespace, is an assertion-delivery endpoint for whoever claims the name. No misconfiguration in Entra required.
+
+The stolen artifact is **post-authentication**, so phishing-resistant MFA, device compliance and Conditional Access do not mitigate any of this. Prevention lives in the allowlist, in signed-request enforcement, and in SP-side replay controls.
+
+## Install
+
+```bash
+pip install -r requirements.txt
+```
+
+`dnspython` is optional but recommended — without it the tool falls back to basic resolution and cannot follow CNAME chains into claimable namespaces.
+
+## Usage
+
+```bash
+# interactive, delegated
+python acs_audit.py --tenant contoso.onmicrosoft.com --device-code -v
+
+# app-only
+python acs_audit.py --tenant <tenant-id> \
+  --client-id <id> --client-secret <secret> \
+  --out-json findings.json --out-csv findings.csv
+
+# bring your own token
+GRAPH_TOKEN=eyJ0... python acs_audit.py --tenant <tenant-id>
+
+# CI gate
+python acs_audit.py --tenant <tenant-id> --client-id ... --client-secret ... \
+  --skip-dns --fail-on HIGH
+```
+
+Required Graph permissions, both read-only: `Application.Read.All`, `Directory.Read.All`.
+
+The tool issues `GET` requests only. It never writes to the directory.
+
+### Useful flags
+
+| Flag | Effect |
+|---|---|
+| `--owned-domains a.com,b.com` | Override the ownership baseline; defaults to the tenant's verified domains |
+| `--skip-dns` | Skip resolution (fast pass, or for air-gapped/egress-restricted runs) |
+| `--include-clean` | Emit apps with no findings, for full inventory |
+| `--quiet-info` | Suppress LOW/INFO in console output |
+| `--fail-on SEVERITY` | Exit 2 if anything at or above that severity is found |
+
+## Findings
+
+| Code | Severity | Meaning |
+|---|---|---|
+| `DANGLING_DNS` | CRITICAL | Registered reply URL host does not resolve. Whoever claims the name receives assertions for this app. |
+| `WILDCARD_REPLY_URL` | CRITICAL | Wildcard in the reply URL — the exact-match allowlist no longer constrains delivery. |
+| `CNAME_TO_CLAIMABLE_SERVICE` | HIGH | CNAME chain terminates in a takeover-prone namespace. |
+| `TAKEOVER_PRONE_NAMESPACE` | HIGH | Host itself sits in a claimable namespace (`*.azurewebsites.net`, `*.herokuapp.com`, S3, etc.). |
+| `NON_HTTPS` | HIGH | Assertion or authorization code would traverse cleartext. Loopback is excluded. |
+| `SAML_UNSIGNED_REQUESTS_ACCEPTED` | MEDIUM | `requestSignatureVerification.isSignedRequestRequired` is not `true`. The allowlist is the only control. |
+| `SIGNING_ENFORCED_NO_VERIFY_CERT` | MEDIUM | Signed requests required but no `keyCredential` with `usage=Verify`. |
+| `UNVERIFIED_DOMAIN` | MEDIUM / LOW | Host is not under a domain verified in this tenant. Expected for SaaS; confirm the recipient is intended. |
+| `LOOPBACK_OR_PRIVATE` | MEDIUM / LOW | Loopback or RFC1918 host registered. Leftover dev config, and a candidate target when no explicit ACS URL is supplied. |
+| `USERINFO_IN_URL` | MEDIUM | URL contains a userinfo component. |
+| `LARGE_REPLY_URL_SURFACE` | LOW | 10+ registered URLs. Each is a permitted delivery target. |
+| `DISABLED_SP_WITH_URLS` | LOW | Service principal disabled but reply URLs remain. |
+| `MULTITENANT_APP` | INFO | App owned by another tenant; hygiene is the vendor's responsibility. |
+
+`DANGLING_DNS` and `WILDCARD_REPLY_URL` are the two that mean *act today*. `SAML_UNSIGNED_REQUESTS_ACCEPTED` on its own will fire across most of the estate — treat it as a hardening backlog, not an incident.
+
+## Triage
+
+A finding is not a confirmed vulnerability. To confirm one, in your own tenant against a non-production app with a test identity:
+
+1. Craft an AuthnRequest with the ACS set to a collaborator endpoint you control.
+2. Complete the authentication with a real test account.
+3. Observe the outcome. `AADSTS50011` means the allowlist held. A POST to the collaborator means it did not.
+
+Anything short of completing step 2 is inconclusive, because Entra validates the reply URL only after authorization succeeds.
+
+## Remediation
+
+- Prune reply URLs to the minimum. Exact match, HTTPS only, no wildcards, nothing pointing at a host you cannot prove ownership of today. Stale entries are not inert — when a request carries no explicit ACS URL, Entra may select any configured reply URL.
+- Enable signed-request enforcement on tier-0 SAML apps and upload the SP signing certificate. Set `AuthnRequestsSigned="true"` on the SP side to match.
+- Treat reply-URL write as a privileged operation. Application Administrator, Cloud Application Administrator and per-app Owner all grant it, and each is a silent assertion-redirect primitive.
+- Monitor `AuditLogs` for `AppAddresses` / `ReplyUrls` modifications, and `SigninLogs` for `ResultType == 50011` bursts.
+- On the SP side: enforce `InResponseTo` correlation, `Destination`/`Recipient`/`Audience` validation, a working one-time-use replay cache, and disable unsolicited SSO where it is not needed.
+
+## Tests
+
+```bash
+python3 test_acs_audit.py
+```
+
+Runs the detection logic against synthetic Graph responses. No tenant or network required.
+
+## Caveats
+
+- `requestSignatureVerification` is not selectable on every API surface. If the `$select` is rejected the tool retries without it and reports signed-request state as unknown rather than failing the run.
+- `preferredSingleSignOnMode` is not always populated for gallery apps, so SAML capability is inferred from SSO mode *or* SSO-related service principal tags. Some SAML apps may be classified as non-SAML.
+- The takeover-namespace list is conservative, not exhaustive. Extend `TAKEOVER_SUFFIXES` for your environment.
+- DNS resolution reflects the resolver's view. Run from a host with the same egress as your users before concluding a name is dangling; split-horizon DNS produces false positives.
