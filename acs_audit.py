@@ -896,6 +896,7 @@ def main() -> int:
         acs_candidates.extend(c.strip() for c in chunk.split(",") if c.strip())
 
     dump_domains: set[str] = set()
+    fetched_domains: set[str] | None = None
     if args.from_dump:
         log(f"loading pre-exported Graph data from {args.from_dump}")
         sps, apps, tenant_id, dump_domains = load_dump(args.from_dump)
@@ -904,19 +905,33 @@ def main() -> int:
         log(f"authenticating to tenant {args.tenant} ...")
         token = acquire_token(args)
         log("authenticated; connecting to Microsoft Graph (read-only)")
-        client = GraphClient(token, verbose=args.verbose,
-                             proxy=args.proxy, ca_bundle=args.ca_bundle)
 
-        log("step 1/4: enumerating service principals (enabled apps) ...")
-        sps = fetch_service_principals(client)
-        log(f"step 1/4: done - {len(sps)} service principals")
+        # The service-principal, application, tenant-id and verified-domain
+        # enumerations are independent Graph queries, so run them concurrently.
+        # Each task gets its own GraphClient (its own requests.Session) because a
+        # Session is not guaranteed safe to share across threads.
+        def new_client() -> GraphClient:
+            return GraphClient(token, verbose=args.verbose,
+                               proxy=args.proxy, ca_bundle=args.ca_bundle)
 
-        log("step 2/4: enumerating application registrations ...")
-        apps = fetch_applications(client)
-        log(f"step 2/4: done - {len(apps)} applications")
+        need_domains = not args.owned_domains
+        log("enumerating service principals, applications"
+            + (", verified domains" if need_domains else "")
+            + " and tenant identity in parallel ...")
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            fut_sps = pool.submit(fetch_service_principals, new_client())
+            fut_apps = pool.submit(fetch_applications, new_client())
+            fut_tid = pool.submit(fetch_tenant_id, new_client())
+            fut_dom = pool.submit(fetch_verified_domains, new_client()) if need_domains else None
 
-        log("step 3/4: reading tenant identity ...")
-        tenant_id = fetch_tenant_id(client)
+            sps = fut_sps.result()
+            log(f"done - {len(sps)} service principals")
+            apps = fut_apps.result()
+            log(f"done - {len(apps)} applications")
+            tenant_id = fut_tid.result()
+            if fut_dom is not None:
+                fetched_domains = fut_dom.result()
+                log(f"done - {len(fetched_domains)} verified tenant domains")
 
     if args.owned_domains:
         owned = {d.strip().lower() for d in args.owned_domains.split(",") if d.strip()}
@@ -925,9 +940,7 @@ def main() -> int:
         owned = dump_domains
         log(f"using {len(owned)} verified domain(s) from dump")
     else:
-        log("step 3/4: reading verified tenant domains ...")
-        owned = fetch_verified_domains(client)
-        log(f"step 3/4: done - {len(owned)} verified tenant domains")
+        owned = fetched_domains or set()
 
     log(f"analysing {len(sps)} apps and their reply URLs for exposure ...")
     if acs_candidates:
@@ -939,16 +952,16 @@ def main() -> int:
     log(f"analysis done - {len(records)} app(s) to report")
 
     if not args.skip_dns:
-        log("step 4/4: DNS resolution of registered hosts ...")
+        log("DNS resolution of registered hosts ...")
         run_dns_checks(records, args.dns_workers, args.verbose)
         if not HAVE_DNSPYTHON:
             print("[!] dnspython not installed - CNAME chain analysis unavailable, "
                   "falling back to basic resolution", file=sys.stderr)
         # re-sort: DNS findings can raise severity
         records.sort(key=lambda r: (SEVERITY_ORDER[r.severity], r.display_name.lower()))
-        log("step 4/4: DNS resolution done")
+        log("DNS resolution done")
     else:
-        log("step 4/4: DNS resolution skipped (--skip-dns)")
+        log("DNS resolution skipped (--skip-dns)")
 
     log("building report ...")
     rows = flatten(records)
