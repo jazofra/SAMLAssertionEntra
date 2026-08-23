@@ -122,6 +122,12 @@ SAML_SSO_TAGS = {
 SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
 
 
+def log(msg: str) -> None:
+    """Always-on progress line to stderr, flushed immediately so the user sees
+    each phase as it happens rather than after a long silent buffer."""
+    print(f"[*] {msg}", file=sys.stderr, flush=True)
+
+
 # ---------------------------------------------------------------------------
 # Graph client
 # ---------------------------------------------------------------------------
@@ -192,13 +198,22 @@ class GraphClient:
         status = resp.status_code if resp is not None else 0
         raise GraphError(status, "retries exhausted", url)
 
-    def paged(self, path: str, params: dict | None = None) -> Iterable[dict]:
+    def paged(self, path: str, params: dict | None = None,
+              label: str | None = None) -> Iterable[dict]:
         url = f"{GRAPH}{path}"
         first = True
+        page = 0
+        total = 0
         while url:
             data = self.get(url, params=params if first else None)
             first = False
-            yield from data.get("value", [])
+            batch = data.get("value", [])
+            page += 1
+            total += len(batch)
+            if label:
+                more = " (more pages)" if data.get("@odata.nextLink") else ""
+                log(f"  {label}: fetched page {page}, {total} so far{more}")
+            yield from batch
             url = data.get("@odata.nextLink")
 
 
@@ -313,7 +328,8 @@ def fetch_service_principals(client: GraphClient) -> list[dict]:
             "accountEnabled", "servicePrincipalType", "appOwnerOrganizationId", "tags",
         ]
     )
-    return list(client.paged("/servicePrincipals", {"$select": select, "$top": "999"}))
+    return list(client.paged("/servicePrincipals", {"$select": select, "$top": "999"},
+                             label="service principals"))
 
 
 def fetch_applications(client: GraphClient) -> list[dict]:
@@ -327,6 +343,7 @@ def fetch_applications(client: GraphClient) -> list[dict]:
             client.paged(
                 "/applications",
                 {"$select": ",".join(base + ["requestSignatureVerification"]), "$top": "999"},
+                label="applications",
             )
         )
     except GraphError as e:
@@ -334,7 +351,8 @@ def fetch_applications(client: GraphClient) -> list[dict]:
             raise
         print("[!] requestSignatureVerification not selectable; retrying without it "
               "(signed-request state will be reported as unknown)", file=sys.stderr)
-        return list(client.paged("/applications", {"$select": ",".join(base), "$top": "999"}))
+        return list(client.paged("/applications", {"$select": ",".join(base), "$top": "999"},
+                                 label="applications"))
 
 
 def fetch_tenant_id(client: GraphClient) -> str | None:
@@ -584,14 +602,20 @@ def resolve_host(host: str, timeout: float = 5.0) -> tuple[str, list[str]]:
 def run_dns_checks(apps: list[AppRecord], workers: int, verbose: bool) -> None:
     hosts = {u.host for a in apps for u in a.urls if u.host and "*" not in u.host}
     if not hosts:
+        log("DNS: no resolvable hosts to check")
         return
-    if verbose:
-        print(f"[*] resolving {len(hosts)} distinct hosts", file=sys.stderr)
+    log(f"DNS: resolving {len(hosts)} distinct hosts with {workers} workers "
+        "(use --skip-dns to skip)")
 
+    hosts = list(hosts)
+    total = len(hosts)
+    step = max(1, total // 10)  # report roughly every 10%
     results: dict[str, tuple[str, list[str]]] = {}
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        for host, res in zip(hosts, pool.map(resolve_host, hosts)):
+        for i, (host, res) in enumerate(zip(hosts, pool.map(resolve_host, hosts)), 1):
             results[host] = res
+            if i % step == 0 or i == total:
+                log(f"  DNS: {i}/{total} hosts resolved")
 
     for app in apps:
         for u in app.urls:
@@ -873,51 +897,60 @@ def main() -> int:
 
     dump_domains: set[str] = set()
     if args.from_dump:
+        log(f"loading pre-exported Graph data from {args.from_dump}")
         sps, apps, tenant_id, dump_domains = load_dump(args.from_dump)
-        if args.verbose:
-            print(f"[*] loaded {len(sps)} service principals, {len(apps)} applications "
-                  f"from {args.from_dump}", file=sys.stderr)
+        log(f"loaded {len(sps)} service principals and {len(apps)} applications from dump")
     else:
+        log(f"authenticating to tenant {args.tenant} ...")
         token = acquire_token(args)
+        log("authenticated; connecting to Microsoft Graph (read-only)")
         client = GraphClient(token, verbose=args.verbose,
                              proxy=args.proxy, ca_bundle=args.ca_bundle)
 
-        if args.verbose:
-            print("[*] enumerating service principals", file=sys.stderr)
+        log("step 1/4: enumerating service principals (enabled apps) ...")
         sps = fetch_service_principals(client)
-        if args.verbose:
-            print(f"[*] {len(sps)} service principals", file=sys.stderr)
-            print("[*] enumerating application registrations", file=sys.stderr)
-        apps = fetch_applications(client)
-        if args.verbose:
-            print(f"[*] {len(apps)} applications", file=sys.stderr)
+        log(f"step 1/4: done - {len(sps)} service principals")
 
+        log("step 2/4: enumerating application registrations ...")
+        apps = fetch_applications(client)
+        log(f"step 2/4: done - {len(apps)} applications")
+
+        log("step 3/4: reading tenant identity ...")
         tenant_id = fetch_tenant_id(client)
 
     if args.owned_domains:
         owned = {d.strip().lower() for d in args.owned_domains.split(",") if d.strip()}
+        log(f"using {len(owned)} owned domain(s) from --owned-domains")
     elif args.from_dump:
         owned = dump_domains
-        if args.verbose:
-            print(f"[*] {len(owned)} verified domains from dump", file=sys.stderr)
+        log(f"using {len(owned)} verified domain(s) from dump")
     else:
+        log("step 3/4: reading verified tenant domains ...")
         owned = fetch_verified_domains(client)
-        if args.verbose:
-            print(f"[*] {len(owned)} verified tenant domains", file=sys.stderr)
+        log(f"step 3/4: done - {len(owned)} verified tenant domains")
 
+    log(f"analysing {len(sps)} apps and their reply URLs for exposure ...")
+    if acs_candidates:
+        log(f"  also testing {len(acs_candidates)} supplied ACS URL(s) against every allowlist")
     records = build_records(
         sps, apps, owned, tenant_id, args.include_clean,
         acs_candidates=acs_candidates, saml_only=args.saml_only,
     )
+    log(f"analysis done - {len(records)} app(s) to report")
 
     if not args.skip_dns:
+        log("step 4/4: DNS resolution of registered hosts ...")
         run_dns_checks(records, args.dns_workers, args.verbose)
         if not HAVE_DNSPYTHON:
             print("[!] dnspython not installed - CNAME chain analysis unavailable, "
                   "falling back to basic resolution", file=sys.stderr)
         # re-sort: DNS findings can raise severity
         records.sort(key=lambda r: (SEVERITY_ORDER[r.severity], r.display_name.lower()))
+        log("step 4/4: DNS resolution done")
+    else:
+        log("step 4/4: DNS resolution skipped (--skip-dns)")
 
+    log("building report ...")
     rows = flatten(records)
     print_console(records, rows, args.quiet_info)
 
@@ -959,6 +992,7 @@ def main() -> int:
         write_csv(args.out_csv, rows)
         print(f"[+] CSV written to {args.out_csv}")
 
+    log("done")
     if args.fail_on:
         threshold = SEVERITY_ORDER[args.fail_on]
         if any(SEVERITY_ORDER[r["severity"]] <= threshold for r in rows):
