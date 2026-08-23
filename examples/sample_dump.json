@@ -1,0 +1,49 @@
+{
+  "_comment": "Example offline dump for `python acs_audit.py --from-dump examples/sample_dump.json`. Each element under servicePrincipals/applications is a raw Microsoft Graph object as returned by GET /servicePrincipals and GET /applications. This one mirrors the ROSS bug-bounty scenario: two Shibboleth SAML SPs whose Entra apps do not require signed AuthnRequests.",
+  "tenantId": "5dbf1add-202a-4b8d-815b-bf0fb024e033",
+  "verifiedDomains": ["hccloud.siemens.com", "siemens-healthineers.com"],
+  "servicePrincipals": [
+    {
+      "id": "sp-ross-dev",
+      "appId": "app-ross-dev",
+      "displayName": "ROSS (dev)",
+      "preferredSingleSignOnMode": "saml",
+      "accountEnabled": true,
+      "appOwnerOrganizationId": "5dbf1add-202a-4b8d-815b-bf0fb024e033",
+      "tags": ["WindowsAzureActiveDirectoryCustomSingleSignOnApplication"],
+      "replyUrls": [
+        "https://ross-dev.hccloud.siemens.com/portal/Shibboleth.sso/SAML2/POST"
+      ]
+    },
+    {
+      "id": "sp-ross-prod",
+      "appId": "app-ross-prod",
+      "displayName": "ROSS (production)",
+      "preferredSingleSignOnMode": "saml",
+      "accountEnabled": true,
+      "appOwnerOrganizationId": "5dbf1add-202a-4b8d-815b-bf0fb024e033",
+      "tags": ["WindowsAzureActiveDirectoryCustomSingleSignOnApplication"],
+      "replyUrls": [
+        "https://ross.hccloud.siemens.com/portal/Shibboleth.sso/SAML2/POST"
+      ]
+    }
+  ],
+  "applications": [
+    {
+      "id": "a-ross-dev",
+      "appId": "app-ross-dev",
+      "displayName": "ROSS (dev)",
+      "requestSignatureVerification": {"isSignedRequestRequired": false},
+      "keyCredentials": [],
+      "web": {"redirectUris": []}
+    },
+    {
+      "id": "a-ross-prod",
+      "appId": "app-ross-prod",
+      "displayName": "ROSS (production)",
+      "requestSignatureVerification": {"isSignedRequestRequired": false},
+      "keyCredentials": [],
+      "web": {"redirectUris": []}
+    }
+  ]
+}

@@ -6,7 +6,13 @@
 
 import sys
 
-from acs_audit import build_records, flatten, print_console
+from acs_audit import (
+    acs_candidate_match,
+    build_records,
+    flatten,
+    normalise_for_match,
+    print_console,
+)
 
 TENANT_ID = "11111111-1111-1111-1111-111111111111"
 OWNED = {"contoso.com", "contoso.onmicrosoft.com"}
@@ -67,6 +73,82 @@ APPS = [
 ]
 
 
+def test_match_helpers() -> bool:
+    ok = True
+
+    # Exact match after normalisation (default port filled in, host lowercased).
+    if acs_candidate_match(
+        "https://ross.contoso.com/portal/Shibboleth.sso/SAML2/POST",
+        "https://ROSS.contoso.com:443/portal/Shibboleth.sso/SAML2/POST",
+    ) != "exact":
+        print("FAIL - normalised exact match not detected")
+        ok = False
+
+    # A brand-new attacker URL matches nothing (Entra would return AADSTS50011).
+    if acs_candidate_match(
+        "https://ross.contoso.com/portal/Shibboleth.sso/SAML2/POST",
+        "https://attacker.oast.me/saml/acs",
+    ) is not None:
+        print("FAIL - unrelated attacker URL should not match a real reply URL")
+        ok = False
+
+    # A wildcard reply URL swallows anything under it.
+    if acs_candidate_match(
+        "https://*.dev.contoso.com/saml/acs",
+        "https://attacker.dev.contoso.com/saml/acs",
+    ) != "wildcard":
+        print("FAIL - wildcard reply URL did not match candidate under it")
+        ok = False
+
+    if normalise_for_match("https://Host.Example/") != "https://host.example:443/":
+        print("FAIL - normalise_for_match did not canonicalise host/port/path")
+        ok = False
+
+    return ok
+
+
+def test_acs_url_check() -> bool:
+    ok = True
+
+    # The exact ROSS reply URL is registered on app-1; supplying it as the
+    # injected ACS URL must flag app-1 as ACCEPTED, and the wildcard on app-1
+    # must also accept a host beneath *.dev.contoso.com.
+    records = build_records(
+        SPS, APPS, OWNED, TENANT_ID, include_all=False,
+        acs_candidates=[
+            "https://ross.contoso.com/portal/Shibboleth.sso/SAML2/POST",
+            "https://evil.dev.contoso.com/saml/acs",
+            "https://attacker.oast.me/saml/acs",
+        ],
+    )
+    rows = flatten(records)
+    codes = {c for r in rows for c in r["codes"].split(";") if c}
+    if "ACS_URL_ACCEPTED" not in codes:
+        print("FAIL - exact injected ACS URL was not flagged as accepted")
+        ok = False
+    if "ACS_URL_ACCEPTED_VIA_WILDCARD" not in codes:
+        print("FAIL - wildcard-covered injected ACS URL was not flagged")
+        ok = False
+
+    accepting_apps = {
+        r["app"] for r in rows
+        if "ACS_URL_ACCEPTED" in r["codes"] or "ACS_URL_ACCEPTED_VIA_WILDCARD" in r["codes"]
+    }
+    if accepting_apps != {"ROSS Portal"}:
+        print(f"FAIL - unexpected apps accepted the injected URL: {accepting_apps}")
+        ok = False
+
+    return ok
+
+
+def test_saml_only() -> bool:
+    records = build_records(SPS, APPS, OWNED, TENANT_ID, include_all=True, saml_only=True)
+    if any(not r.saml_capable for r in records):
+        print("FAIL - --saml-only leaked a non-SAML app")
+        return False
+    return True
+
+
 def main() -> int:
     records = build_records(SPS, APPS, OWNED, TENANT_ID, include_all=False)
     rows = flatten(records)
@@ -98,7 +180,15 @@ def main() -> int:
         print("FAIL - wildcard reply URL did not escalate to CRITICAL")
         return 1
 
+    if not test_match_helpers():
+        return 1
+    if not test_acs_url_check():
+        return 1
+    if not test_saml_only():
+        return 1
+
     print("PASS - all expected detections fired, hardened app is clean")
+    print("PASS - injected ACS URL check, wildcard match, and --saml-only behave correctly")
     return 0
 
 
