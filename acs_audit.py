@@ -121,6 +121,12 @@ SAML_SSO_TAGS = {
 
 SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
 
+# URL sources Entra can deliver a SAML assertion to. The enterprise app's reply
+# URLs and the registration's web redirect URIs are the same allowlist seen from
+# two objects. Logout URLs, SPA and public-client redirect URIs never receive an
+# assertion, so they are not ACS targets.
+ACS_SOURCES = {"sp.replyUrls", "app.web"}
+
 
 def log(msg: str) -> None:
     """Always-on progress line to stderr, flushed immediately so the user sees
@@ -242,14 +248,23 @@ def acquire_token(args: argparse.Namespace) -> str:
     authority = f"https://login.microsoftonline.com/{args.tenant}"
     scope = ["https://graph.microsoft.com/.default"]
 
+    # Send sign-in through the same proxy / CA bundle as the Graph calls. Without
+    # these MSAL still honours HTTPS_PROXY / REQUESTS_CA_BUNDLE from the
+    # environment, but would ignore --proxy / --ca-bundle.
+    net: dict[str, Any] = {}
+    if args.proxy:
+        net["proxies"] = {"http": args.proxy, "https": args.proxy}
+    if args.ca_bundle:
+        net["verify"] = args.ca_bundle
+
     if args.client_secret:
         app = msal.ConfidentialClientApplication(
-            args.client_id, authority=authority, client_credential=args.client_secret
+            args.client_id, authority=authority, client_credential=args.client_secret, **net
         )
         result = app.acquire_token_for_client(scopes=scope)
     else:
         client_id = args.client_id or DEFAULT_PUBLIC_CLIENT_ID
-        app = msal.PublicClientApplication(client_id, authority=authority)
+        app = msal.PublicClientApplication(client_id, authority=authority, **net)
         flow = app.initiate_device_flow(scopes=["https://graph.microsoft.com/.default"])
         if "user_code" not in flow:
             sys.exit(f"device flow failed: {json.dumps(flow, indent=2)}")
@@ -292,6 +307,7 @@ class AppRecord:
     app_object_id: str | None = None
     sso_mode: str | None = None
     saml_capable: bool = False
+    saml_evidence: str = ""  # why the app was classified as SAML, for triage
     account_enabled: bool | None = None
     is_foreign_tenant: bool = False
     signed_requests_required: bool | None = None
@@ -322,14 +338,27 @@ def fetch_verified_domains(client: GraphClient) -> set[str]:
 
 
 def fetch_service_principals(client: GraphClient) -> list[dict]:
-    select = ",".join(
-        [
-            "id", "appId", "displayName", "replyUrls", "preferredSingleSignOnMode",
-            "accountEnabled", "servicePrincipalType", "appOwnerOrganizationId", "tags",
-        ]
-    )
-    return list(client.paged("/servicePrincipals", {"$select": select, "$top": "999"},
-                             label="service principals"))
+    base = [
+        "id", "appId", "displayName", "replyUrls", "preferredSingleSignOnMode",
+        "accountEnabled", "servicePrincipalType", "appOwnerOrganizationId", "tags",
+    ]
+    # preferredTokenSigningKeyThumbprint is set when the enterprise app has an
+    # active SAML token-signing certificate, which identifies SAML apps whose
+    # preferredSingleSignOnMode was never populated. Fall back if the API
+    # surface rejects it rather than failing the run.
+    try:
+        return list(client.paged(
+            "/servicePrincipals",
+            {"$select": ",".join(base + ["preferredTokenSigningKeyThumbprint"]), "$top": "999"},
+            label="service principals",
+        ))
+    except GraphError as e:
+        if e.status != 400:
+            raise
+        print("[!] preferredTokenSigningKeyThumbprint not selectable; SAML apps will be "
+              "identified by SSO mode and tags only", file=sys.stderr)
+        return list(client.paged("/servicePrincipals", {"$select": ",".join(base), "$top": "999"},
+                                 label="service principals"))
 
 
 def fetch_applications(client: GraphClient) -> list[dict]:
@@ -478,7 +507,7 @@ def analyse_url(
     # (e.g. the one from a bug-bounty report), flag every app whose allowlist
     # would actually deliver an assertion there. This is the concrete answer to
     # "which of my apps are affected by this specific URL?".
-    for cand in acs_candidates or []:
+    for cand in (acs_candidates or []) if rec.source in ACS_SOURCES else []:
         match = acs_candidate_match(raw, cand)
         if match == "exact":
             rec.findings.append(
@@ -599,7 +628,8 @@ def resolve_host(host: str, timeout: float = 5.0) -> tuple[str, list[str]]:
         return "error", chain
 
 
-def run_dns_checks(apps: list[AppRecord], workers: int, verbose: bool) -> None:
+def run_dns_checks(apps: list[AppRecord], owned_domains: set[str],
+                   workers: int, verbose: bool = False) -> None:
     hosts = {u.host for a in apps for u in a.urls if u.host and "*" not in u.host}
     if not hosts:
         log("DNS: no resolvable hosts to check")
@@ -623,20 +653,53 @@ def run_dns_checks(apps: list[AppRecord], workers: int, verbose: bool) -> None:
             u.dns_status = status
             u.dns_chain = chain
 
-            if status in ("nxdomain", "no_address"):
-                u.findings.append(
-                    Finding("CRITICAL", "DANGLING_DNS",
-                            f"Host does not resolve ({status}) but is an accepted reply URL - "
-                            "anyone able to claim this name receives assertions for this app")
-                )
+            # A CNAME into a claimable namespace is the real takeover primitive:
+            # the target resource (an Azure/Heroku/etc. app) was deleted and can
+            # be re-created by anyone. Flag it regardless of who owns the apex.
+            claimable_chain = False
             for target in chain:
                 suf = takeover_suffix(target)
                 if suf:
+                    claimable_chain = True
                     u.findings.append(
                         Finding("HIGH", "CNAME_TO_CLAIMABLE_SERVICE",
-                                f"CNAME chain reaches '{target}' in claimable namespace '{suf}'")
+                                f"CNAME chain reaches '{target}' in claimable namespace '{suf}' - "
+                                "if that resource is deleted, anyone can re-create it and receive "
+                                "assertions for this app")
                     )
                     break
+
+            if status in ("nxdomain", "no_address") and not claimable_chain:
+                if registrable_match(u.host, owned_domains):
+                    # Under a domain this tenant has verified. An attacker cannot
+                    # receive assertions here without control of your DNS zone, so
+                    # this is stale config to prune, not a live hijack primitive.
+                    u.findings.append(
+                        Finding("LOW", "DANGLING_DNS_OWNED_ZONE",
+                                f"Host does not resolve ({status}) but sits under a verified "
+                                "domain - stale reply URL; prune it. Not attacker-claimable "
+                                "unless your DNS zone is compromised.")
+                    )
+                else:
+                    # Not under a verified domain and does not resolve. If the
+                    # registrable domain is unregistered or expired it can be
+                    # claimed; confirm registration before treating as safe.
+                    u.findings.append(
+                        Finding("HIGH", "DANGLING_DNS",
+                                f"Host does not resolve ({status}) and is not under a verified "
+                                "domain - if its registrable domain is unregistered/expired, "
+                                "whoever registers it receives assertions for this app. Verify "
+                                "the domain registration.")
+                    )
+            elif status in ("error", "timeout"):
+                # Do not silently drop hosts the resolver could not answer for
+                # (throttling, network). Surface them so the run is not falsely
+                # read as clean; re-run these before concluding anything.
+                u.findings.append(
+                    Finding("LOW", "DNS_LOOKUP_FAILED",
+                            f"DNS lookup did not complete ({status}) - not evaluated. Re-run "
+                            "(lower --dns-workers if this is widespread) before trusting the result.")
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -650,6 +713,7 @@ def build_records(
     include_all: bool,
     acs_candidates: list[str] | None = None,
     saml_only: bool = False,
+    run_filter: bool = True,
 ) -> list[AppRecord]:
     by_app_id: dict[str, AppRecord] = {}
     app_index = {a["appId"]: a for a in apps if a.get("appId")}
@@ -662,13 +726,20 @@ def build_records(
         sso = sp.get("preferredSingleSignOnMode")
         reply_urls = sp.get("replyUrls") or []
 
-        saml_capable = sso == "saml" or bool(SAML_SSO_TAGS.intersection(tags))
+        evidence = []
+        if sso == "saml":
+            evidence.append("preferredSingleSignOnMode=saml")
+        if SAML_SSO_TAGS.intersection(tags):
+            evidence.append("SAML SSO tag")
+        if sp.get("preferredTokenSigningKeyThumbprint"):
+            evidence.append("SAML signing certificate")
         rec = AppRecord(
             app_id=app_id,
             display_name=sp.get("displayName") or "(unnamed)",
             sp_object_id=sp.get("id"),
             sso_mode=sso,
-            saml_capable=saml_capable,
+            saml_capable=bool(evidence),
+            saml_evidence=", ".join(evidence),
             account_enabled=sp.get("accountEnabled"),
             tags=tags,
         )
@@ -753,9 +824,59 @@ def build_records(
     if saml_only:
         records = [r for r in records if r.saml_capable]
 
+    # DNS findings (added after this function returns) can promote a "clean" app
+    # to a real finding and raise severity, so the caller can defer the
+    # drop-clean filter and final sort until after run_dns_checks.
+    if run_filter:
+        records = finalize_records(records, include_all)
+    return records
+
+
+# Reply-URL findings that mean an attacker could actually *receive* the assertion
+# at an allowlisted URL (as opposed to merely a hygiene/interception concern).
+ATTACKER_CONTROLLABLE_CODES = {
+    "WILDCARD_REPLY_URL",           # any URL, incl. attacker's, is honoured
+    "DANGLING_DNS",                 # unowned, unresolved -> registrable/claimable
+    "CNAME_TO_CLAIMABLE_SERVICE",   # deleted third-party resource, re-creatable
+    "TAKEOVER_PRONE_NAMESPACE",     # host in a claimable namespace
+}
+
+
+def correlate_assertion_hijack(records: list[AppRecord]) -> None:
+    """Synthesise the exact condition from the ROSS report at app level so the
+    estate can be triaged by 'same exposure as the reported app'.
+
+    The reported precondition is: a SAML app that does not enforce signed
+    AuthnRequests, so Entra honours the AssertionConsumerServiceURL of any
+    unsigned request that matches the reply-URL allowlist. That alone is not a
+    confirmed takeover (Entra still returns AADSTS50011 for a URL off the
+    allowlist - which is why the report's brand-new attacker URL was not proven).
+    It becomes a live assertion-hijack only when the allowlist also contains a
+    reply URL an attacker can receive at: a wildcard, or a dangling/claimable
+    host. This flags that combination; run without --skip-dns for full coverage."""
+    for rec in records:
+        if not rec.saml_capable or rec.signed_requests_required is True:
+            continue  # signed-request enforcement defeats the reported vector
+        hijack_urls = [
+            (u.url, code)
+            for u in rec.urls
+            for code in {f.code for f in u.findings}
+            if code in ATTACKER_CONTROLLABLE_CODES
+        ]
+        if not hijack_urls:
+            continue
+        why = "; ".join(f"{url} ({code})" for url, code in hijack_urls)
+        rec.findings.append(
+            Finding("CRITICAL", "ASSERTION_HIJACKABLE",
+                    "Same exposure as the reported app: SAML with signed AuthnRequests not "
+                    "enforced, AND a reply URL an attacker could receive at -> a victim's signed "
+                    f"assertion can be redirected and replayed. Attacker-reachable URL(s): {why}")
+        )
+
+
+def finalize_records(records: list[AppRecord], include_all: bool) -> list[AppRecord]:
     if not include_all:
         records = [r for r in records if r.findings or any(u.findings for u in r.urls)]
-
     records.sort(key=lambda r: (SEVERITY_ORDER[r.severity], r.display_name.lower()))
     return records
 
@@ -803,7 +924,13 @@ def flatten(records: list[AppRecord]) -> list[dict[str, Any]]:
 
 def print_console(records: list[AppRecord], rows: list[dict], quiet_info: bool) -> None:
     counts = Counter(r["severity"] for r in rows)
-    code_counts = Counter(c for r in rows for c in r["codes"].split(";") if c)
+    # Count each finding code once per app; app-level findings repeat on every
+    # URL row, so counting rows would inflate them.
+    code_counts = Counter(
+        c for (app, c) in {
+            (r["app"], c) for r in rows for c in r["codes"].split(";") if c
+        }
+    )
 
     print("\n=== Entra ID reply URL / SAML ACS exposure ===\n")
     for sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"):
@@ -945,23 +1072,28 @@ def main() -> int:
     log(f"analysing {len(sps)} apps and their reply URLs for exposure ...")
     if acs_candidates:
         log(f"  also testing {len(acs_candidates)} supplied ACS URL(s) against every allowlist")
+    # Keep every app (run_filter=False) so DNS is checked even on apps with no
+    # static finding yet - a dangling/claimable reply URL on an otherwise clean,
+    # hardened app is exactly the takeover this tool exists to catch.
     records = build_records(
         sps, apps, owned, tenant_id, args.include_clean,
-        acs_candidates=acs_candidates, saml_only=args.saml_only,
+        acs_candidates=acs_candidates, saml_only=args.saml_only, run_filter=False,
     )
-    log(f"analysis done - {len(records)} app(s) to report")
 
     if not args.skip_dns:
-        log("DNS resolution of registered hosts ...")
-        run_dns_checks(records, args.dns_workers, args.verbose)
+        log("DNS resolution of registered hosts (every app) ...")
+        run_dns_checks(records, owned, args.dns_workers, args.verbose)
         if not HAVE_DNSPYTHON:
             print("[!] dnspython not installed - CNAME chain analysis unavailable, "
                   "falling back to basic resolution", file=sys.stderr)
-        # re-sort: DNS findings can raise severity
-        records.sort(key=lambda r: (SEVERITY_ORDER[r.severity], r.display_name.lower()))
         log("DNS resolution done")
     else:
-        log("DNS resolution skipped (--skip-dns)")
+        log("DNS resolution skipped (--skip-dns) - dangling/claimable reply URLs "
+            "will NOT be detected")
+
+    correlate_assertion_hijack(records)
+    records = finalize_records(records, args.include_clean)
+    log(f"analysis done - {len(records)} app(s) to report")
 
     log("building report ...")
     rows = flatten(records)

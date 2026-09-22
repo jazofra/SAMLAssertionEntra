@@ -86,23 +86,42 @@ The dump is a JSON object with two arrays of **raw** Graph objects:
 }
 ```
 
-Export them however you like, for example with the Azure CLI:
+Export the two collections however you like. The simplest is to let the tool do
+it and then re-read it offline — `--out-json findings.json` is a *report*, not a
+dump, so use a small helper that follows `@odata.nextLink` (a single Graph page
+is only 999 objects; a raw `$top=999` call silently drops the rest of a large
+tenant). Save as `export_dump.py` and run it with the same auth as the audit:
 
-```bash
-python - <<'PY' > dump.json
-import json, subprocess
-def graph(path):
-    out = subprocess.check_output(["az", "rest", "--method", "get", "--url",
-        "https://graph.microsoft.com/v1.0" + path])
-    return json.loads(out)["value"]
+```python
+# export_dump.py - writes dump.json for `acs_audit.py --from-dump dump.json`
+import json, os, requests
+TOKEN = os.environ["GRAPH_TOKEN"]                      # a Graph access token
+G = "https://graph.microsoft.com/v1.0"
+H = {"Authorization": f"Bearer {TOKEN}"}
+
+def collect(path):
+    items, url = [], G + path
+    while url:
+        r = requests.get(url, headers=H, timeout=60); r.raise_for_status()
+        d = r.json(); items += d.get("value", []); url = d.get("@odata.nextLink")
+    return items
+
 json.dump({
-    "servicePrincipals": graph("/servicePrincipals?$select=id,appId,displayName,replyUrls,"
-        "preferredSingleSignOnMode,accountEnabled,servicePrincipalType,appOwnerOrganizationId,tags&$top=999"),
-    "applications": graph("/applications?$select=id,appId,displayName,web,spa,publicClient,"
-        "keyCredentials,identifierUris,signInAudience,requestSignatureVerification&$top=999"),
-}, __import__("sys").stdout, indent=2)
-PY
-python acs_audit.py --from-dump dump.json
+    "servicePrincipals": collect("/servicePrincipals?$select=id,appId,displayName,"
+        "replyUrls,preferredSingleSignOnMode,accountEnabled,servicePrincipalType,"
+        "appOwnerOrganizationId,tags,preferredTokenSigningKeyThumbprint&$top=999"),
+    "applications": collect("/applications?$select=id,appId,displayName,web,spa,"
+        "publicClient,keyCredentials,identifierUris,signInAudience,"
+        "requestSignatureVerification&$top=999"),
+}, open("dump.json", "w"), indent=2)
+print("wrote dump.json")
+```
+
+```powershell
+# PowerShell: get a token with the Azure CLI, then export and analyse offline
+$env:GRAPH_TOKEN = (az account get-access-token --resource https://graph.microsoft.com --query accessToken -o tsv)
+python .\export_dump.py
+python .\acs_audit.py --from-dump dump.json
 ```
 
 ### Useful flags
@@ -117,8 +136,8 @@ python acs_audit.py --from-dump dump.json
 | `--include-clean` | Emit apps with no findings, for full inventory |
 | `--quiet-info` | Suppress LOW/INFO in console output |
 | `--fail-on SEVERITY` | Exit 2 if anything at or above that severity is found |
-| `--proxy URL` | Route Graph calls through an HTTP(S) proxy (overrides `HTTPS_PROXY`) |
-| `--ca-bundle PATH` | Trust this CA bundle, for proxies that do TLS inspection (overrides `REQUESTS_CA_BUNDLE`) |
+| `--proxy URL` | Route Graph **and sign-in** through an HTTP(S) proxy (overrides `HTTPS_PROXY`) |
+| `--ca-bundle PATH` | Trust this CA bundle for both Graph and sign-in (overrides `REQUESTS_CA_BUNDLE`) |
 
 Either `--tenant` or `--from-dump` is required.
 
@@ -137,7 +156,7 @@ $env:HTTPS_PROXY = "http://your-proxy:8080"
 $env:REQUESTS_CA_BUNDLE = "C:\path\to\corp-root-ca.pem"
 python .\acs_audit.py --tenant <tenant-id> --client-id <id> --client-secret <secret>
 
-# …or pass them explicitly instead of env vars:
+# …or pass them explicitly instead of env vars (these apply to sign-in too):
 python .\acs_audit.py --tenant <tenant-id> --client-id <id> --client-secret <secret> `
   --proxy "http://your-proxy:8080" --ca-bundle "C:\path\to\corp-root-ca.pem"
 ```
@@ -153,21 +172,26 @@ users, or export the two collections elsewhere and analyse them with
 |---|---|---|
 | `ACS_URL_ACCEPTED` | CRITICAL | A `--check-acs-url` candidate exactly matches a registered reply URL. Entra would deliver the assertion there — this app is affected by that specific URL. |
 | `ACS_URL_ACCEPTED_VIA_WILDCARD` | CRITICAL | A `--check-acs-url` candidate is covered by a wildcard reply URL. |
-| `DANGLING_DNS` | CRITICAL | Registered reply URL host does not resolve. Whoever claims the name receives assertions for this app. |
+| `ASSERTION_HIJACKABLE` | CRITICAL | **The reported ROSS pattern.** A SAML app that does not enforce signed AuthnRequests *and* has a reply URL an attacker can receive at (wildcard / dangling-unowned / claimable). A victim's signed assertion can be redirected and replayed. This is the finding that answers "which other apps have the same live exposure". Requires a DNS pass (do not use `--skip-dns`). |
 | `WILDCARD_REPLY_URL` | CRITICAL | Wildcard in the reply URL — the exact-match allowlist no longer constrains delivery. |
-| `CNAME_TO_CLAIMABLE_SERVICE` | HIGH | CNAME chain terminates in a takeover-prone namespace. |
+| `DANGLING_DNS` | HIGH | Reply URL host does not resolve **and is not under a verified domain**. If its registrable domain is unregistered/expired, whoever registers it receives assertions. Verify the domain registration. |
+| `CNAME_TO_CLAIMABLE_SERVICE` | HIGH | CNAME chain terminates in a takeover-prone namespace whose target resource may be deleted and re-created by anyone. |
 | `TAKEOVER_PRONE_NAMESPACE` | HIGH | Host itself sits in a claimable namespace (`*.azurewebsites.net`, `*.herokuapp.com`, S3, etc.). |
 | `NON_HTTPS` | HIGH | Assertion or authorization code would traverse cleartext. Loopback is excluded. |
 | `SAML_UNSIGNED_REQUESTS_ACCEPTED` | MEDIUM | `requestSignatureVerification.isSignedRequestRequired` is not `true`. The allowlist is the only control. |
 | `SIGNING_ENFORCED_NO_VERIFY_CERT` | MEDIUM | Signed requests required but no `keyCredential` with `usage=Verify`. |
 | `UNVERIFIED_DOMAIN` | MEDIUM / LOW | Host is not under a domain verified in this tenant. Expected for SaaS; confirm the recipient is intended. |
 | `LOOPBACK_OR_PRIVATE` | MEDIUM / LOW | Loopback or RFC1918 host registered. Leftover dev config, and a candidate target when no explicit ACS URL is supplied. |
+| `DANGLING_DNS_OWNED_ZONE` | LOW | Reply URL under a **verified** domain does not resolve. Stale config to prune — not attacker-claimable unless your DNS zone is compromised. |
+| `DNS_LOOKUP_FAILED` | LOW | The resolver could not answer for this host (throttling/network); it was **not** evaluated. Re-run (lower `--dns-workers`) before trusting the result. |
 | `USERINFO_IN_URL` | MEDIUM | URL contains a userinfo component. |
 | `LARGE_REPLY_URL_SURFACE` | LOW | 10+ registered URLs. Each is a permitted delivery target. |
 | `DISABLED_SP_WITH_URLS` | LOW | Service principal disabled but reply URLs remain. |
 | `MULTITENANT_APP` | INFO | App owned by another tenant; hygiene is the vendor's responsibility. |
 
-`DANGLING_DNS` and `WILDCARD_REPLY_URL` are the two that mean *act today*. `SAML_UNSIGNED_REQUESTS_ACCEPTED` on its own will fire across most of the estate — treat it as a hardening backlog, not an incident.
+`ASSERTION_HIJACKABLE`, `WILDCARD_REPLY_URL` and `CNAME_TO_CLAIMABLE_SERVICE` are the ones that mean *act today* — `ASSERTION_HIJACKABLE` is precisely the reported ROSS condition found in another app. `SAML_UNSIGNED_REQUESTS_ACCEPTED` on its own is the reported *precondition* and will fire across most of the estate: it is a real takeover only when combined with an attacker-reachable reply URL (which is what `ASSERTION_HIJACKABLE` reports), so on its own treat it as a hardening backlog, not an incident.
+
+> **Note on `--dns-workers`:** DNS resolution is the only tunable worker pool (the Graph enumerations are a fixed pool of the four independent queries). 50–100 is a sensible range; above that you are limited by your own resolver, and an overloaded resolver returns `DNS_LOOKUP_FAILED`, not a wrong verdict. Because dangling/claimable detection depends on this pass, do not conclude an app is clean from a `--skip-dns` run.
 
 ## Triage
 

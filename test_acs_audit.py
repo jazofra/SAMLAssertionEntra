@@ -9,10 +9,14 @@ import sys
 from acs_audit import (
     acs_candidate_match,
     build_records,
+    correlate_assertion_hijack,
+    finalize_records,
     flatten,
     normalise_for_match,
     print_console,
+    run_dns_checks,
 )
+import acs_audit
 
 TENANT_ID = "11111111-1111-1111-1111-111111111111"
 OWNED = {"contoso.com", "contoso.onmicrosoft.com"}
@@ -149,6 +153,103 @@ def test_saml_only() -> bool:
     return True
 
 
+def _dns(records, resolver, owned=OWNED):
+    """Run the DNS phase with a stubbed resolver, then the correlation pass."""
+    saved = acs_audit.resolve_host
+    acs_audit.resolve_host = resolver
+    try:
+        run_dns_checks(records, owned, workers=4)
+    finally:
+        acs_audit.resolve_host = saved
+    correlate_assertion_hijack(records)
+    return {c for r in flatten(records) for c in r["codes"].split(";") if c}
+
+
+def test_dns_runs_on_clean_apps_and_correlates() -> bool:
+    # Hardened-looking SAML app, no static finding, reply URL CNAMEs to a deleted
+    # Azure app: exactly the takeover the tool exists to catch. It must survive
+    # to the DNS phase (not be filtered as clean) and be correlated CRITICAL.
+    sp = [{"id": "s", "appId": "a", "displayName": "Hardened SAML",
+           "preferredSingleSignOnMode": "saml", "accountEnabled": True,
+           "appOwnerOrganizationId": TENANT_ID, "tags": [],
+           "replyUrls": ["https://sso.contoso.com/acs"]}]
+    ap = [{"id": "x", "appId": "a",
+           "requestSignatureVerification": {"isSignedRequestRequired": False},
+           "keyCredentials": [], "web": {"redirectUris": []}}]
+    recs = build_records(sp, ap, OWNED, TENANT_ID, include_all=False, run_filter=False)
+    codes = _dns(recs, lambda h, timeout=5.0: ("nxdomain", ["old.azurewebsites.net"]))
+    if not {"CNAME_TO_CLAIMABLE_SERVICE", "ASSERTION_HIJACKABLE"} <= codes:
+        print(f"FAIL - clean app's dangling reply URL not detected/correlated: {sorted(codes)}")
+        return False
+    if not finalize_records(recs, include_all=False):
+        print("FAIL - hijackable app was filtered out of the report")
+        return False
+    return True
+
+
+def test_dangling_in_owned_zone_is_low() -> bool:
+    sp = [{"id": "s", "appId": "a", "displayName": "SAML", "preferredSingleSignOnMode": "saml",
+           "accountEnabled": True, "appOwnerOrganizationId": TENANT_ID, "tags": [],
+           "replyUrls": ["https://gone.contoso.com/acs"]}]
+    ap = [{"id": "x", "appId": "a",
+           "requestSignatureVerification": {"isSignedRequestRequired": False},
+           "keyCredentials": [], "web": {"redirectUris": []}}]
+    recs = build_records(sp, ap, OWNED, TENANT_ID, include_all=False, run_filter=False)
+    codes = _dns(recs, lambda h, timeout=5.0: ("nxdomain", []))
+    # Not attacker-claimable (it is our verified zone) -> LOW, and not correlated.
+    if "DANGLING_DNS_OWNED_ZONE" not in codes or "DANGLING_DNS" in codes \
+            or "ASSERTION_HIJACKABLE" in codes:
+        print(f"FAIL - owned-zone dangling misclassified: {sorted(codes)}")
+        return False
+    return True
+
+
+def test_dns_failures_surface() -> bool:
+    sp = [{"id": "s", "appId": "a", "displayName": "SAML", "preferredSingleSignOnMode": "saml",
+           "accountEnabled": True, "appOwnerOrganizationId": TENANT_ID, "tags": [],
+           "replyUrls": ["https://x.contoso.com/acs"]}]
+    ap = [{"id": "x", "appId": "a", "keyCredentials": [], "web": {"redirectUris": []}}]
+    recs = build_records(sp, ap, OWNED, TENANT_ID, include_all=False, run_filter=False)
+    codes = _dns(recs, lambda h, timeout=5.0: ("error", []))
+    if "DNS_LOOKUP_FAILED" not in codes:
+        print(f"FAIL - unresolved host silently dropped: {sorted(codes)}")
+        return False
+    return True
+
+
+def test_acs_url_ignores_non_acs_urls() -> bool:
+    cand = "https://evil.example/logout"
+    ap = [{"id": "x", "appId": "a", "keyCredentials": [],
+           "web": {"redirectUris": [], "logoutUrl": cand}}]
+    sp = [{"id": "s", "appId": "a", "displayName": "App", "preferredSingleSignOnMode": "saml",
+           "accountEnabled": True, "appOwnerOrganizationId": TENANT_ID, "tags": [], "replyUrls": []}]
+    recs = build_records(sp, ap, OWNED, TENANT_ID, include_all=False, acs_candidates=[cand])
+    codes = {c for r in flatten(recs) for c in r["codes"].split(";")}
+    if "ACS_URL_ACCEPTED" in codes:
+        print("FAIL - injected ACS URL matched a logout URL (not an assertion endpoint)")
+        return False
+    # But a real reply URL with the same value must still match.
+    recs = build_records([{**sp[0], "replyUrls": [cand]}], ap, OWNED, TENANT_ID,
+                         include_all=False, acs_candidates=[cand])
+    if "ACS_URL_ACCEPTED" not in {c for r in flatten(recs) for c in r["codes"].split(";")}:
+        print("FAIL - injected ACS URL no longer matches a genuine reply URL")
+        return False
+    return True
+
+
+def test_saml_detected_by_signing_cert() -> bool:
+    sp = [{"id": "s", "appId": "a", "displayName": "Cert SAML", "accountEnabled": True,
+           "appOwnerOrganizationId": TENANT_ID, "tags": [],
+           "preferredTokenSigningKeyThumbprint": "ABC",
+           "replyUrls": ["https://x.contoso.com/acs"]}]
+    ap = [{"id": "x", "appId": "a", "keyCredentials": [], "web": {"redirectUris": []}}]
+    recs = build_records(sp, ap, OWNED, TENANT_ID, include_all=True)
+    if not recs[0].saml_capable:
+        print("FAIL - SAML app with a signing cert but no SSO mode/tag went undetected")
+        return False
+    return True
+
+
 def main() -> int:
     records = build_records(SPS, APPS, OWNED, TENANT_ID, include_all=False)
     rows = flatten(records)
@@ -185,6 +286,16 @@ def main() -> int:
     if not test_acs_url_check():
         return 1
     if not test_saml_only():
+        return 1
+    if not test_dns_runs_on_clean_apps_and_correlates():
+        return 1
+    if not test_dangling_in_owned_zone_is_low():
+        return 1
+    if not test_dns_failures_surface():
+        return 1
+    if not test_acs_url_ignores_non_acs_urls():
+        return 1
+    if not test_saml_detected_by_signing_cert():
         return 1
 
     print("PASS - all expected detections fired, hardened app is clean")
