@@ -50,9 +50,17 @@ When a report hands you the injected ACS URL an attacker used (e.g.
 `https://attacker.oast.me/saml/acs`), pass it with `--check-acs-url` to test it
 against every app's reply-URL allowlist — the exact-match check Entra actually
 performs after authentication. The flag is repeatable and accepts
-comma-separated values. Any app that would deliver an assertion to that URL is
+comma-separated values; each value must be an absolute `http(s)://` URL, and the
+run stops with an error otherwise (a typo can never match, which would read as a
+false all-clear). Any app that would deliver an assertion to that URL is
 flagged `ACS_URL_ACCEPTED` (CRITICAL); if nothing matches, Entra would return
-`AADSTS50011` and the tool says so.
+`AADSTS50011` and the tool says so. Logout URLs are not tested: Entra never
+sends an assertion there.
+
+Matching ignores host casing and a default port (`:443` / `:80`), but compares
+the path and query string exactly and case-sensitively: `/acs` and `/acs?x=1`
+are different reply URLs. A wildcard reply URL is matched permissively — `*`
+covers any characters, and a query appended to the tested URL does not escape it.
 
 ```bash
 python acs_audit.py --tenant <tenant-id> --device-code \
@@ -86,24 +94,37 @@ The dump is a JSON object with two arrays of **raw** Graph objects:
 }
 ```
 
-Export them however you like, for example with the Azure CLI:
+Export them however you like, for example with the Azure CLI. Follow
+`@odata.nextLink`: Graph returns at most 999 objects per page, and a dump that
+stops at the first page silently leaves the rest of the tenant unaudited.
 
 ```bash
-python - <<'PY' > dump.json
+python - <<'PY'
 import json, subprocess
 def graph(path):
-    out = subprocess.check_output(["az", "rest", "--method", "get", "--url",
-        "https://graph.microsoft.com/v1.0" + path])
-    return json.loads(out)["value"]
-json.dump({
+    url, items = "https://graph.microsoft.com/v1.0" + path, []
+    while url:
+        page = json.loads(subprocess.check_output(["az", "rest", "--method", "get", "--url", url]))
+        items += page["value"]
+        url = page.get("@odata.nextLink")
+    return items
+dump = {
     "servicePrincipals": graph("/servicePrincipals?$select=id,appId,displayName,replyUrls,"
         "preferredSingleSignOnMode,accountEnabled,servicePrincipalType,appOwnerOrganizationId,tags&$top=999"),
     "applications": graph("/applications?$select=id,appId,displayName,web,spa,publicClient,"
         "keyCredentials,identifierUris,signInAudience,requestSignatureVerification&$top=999"),
-}, __import__("sys").stdout, indent=2)
+}
+with open("dump.json", "w", encoding="utf-8") as fh:
+    json.dump(dump, fh, indent=2)
 PY
 python acs_audit.py --from-dump dump.json
 ```
+
+The dump may be UTF-8 (with or without a BOM) or UTF-16, so a file produced by
+Windows PowerShell `>` redirection loads as-is. Without `tenantId` the tool
+cannot tell foreign-owned apps apart, and without `verifiedDomains` (or
+`--owned-domains`) it cannot report `UNVERIFIED_DOMAIN`; it warns when either is
+missing.
 
 ### Useful flags
 
@@ -114,11 +135,11 @@ python acs_audit.py --from-dump dump.json
 | `--saml-only` | Restrict the report to SAML-capable apps |
 | `--owned-domains a.com,b.com` | Override the ownership baseline; defaults to the tenant's verified domains |
 | `--skip-dns` | Skip resolution (fast pass, or for air-gapped/egress-restricted runs) |
-| `--include-clean` | Emit apps with no findings, for full inventory |
+| `--include-clean` | Also emit apps with no findings (severity `CLEAN`) to CSV/JSON, for a full reply-URL inventory; the console only counts them |
 | `--quiet-info` | Suppress LOW/INFO in console output |
 | `--fail-on SEVERITY` | Exit 2 if anything at or above that severity is found |
-| `--proxy URL` | Route Graph calls through an HTTP(S) proxy (overrides `HTTPS_PROXY`) |
-| `--ca-bundle PATH` | Trust this CA bundle, for proxies that do TLS inspection (overrides `REQUESTS_CA_BUNDLE`) |
+| `--proxy URL` | Route sign-in and Graph calls through an HTTP(S) proxy (overrides `HTTPS_PROXY`) |
+| `--ca-bundle PATH` | Trust this CA bundle for sign-in and Graph, for proxies that do TLS inspection (overrides `REQUESTS_CA_BUNDLE`) |
 
 Either `--tenant` or `--from-dump` is required.
 
@@ -126,9 +147,10 @@ Either `--tenant` or `--from-dump` is required.
 
 If authentication succeeds but the first Graph call dies with
 `RemoteDisconnected` / `Connection aborted`, a proxy, firewall or TLS-inspection
-appliance is between you and `graph.microsoft.com`. The tool now retries
+appliance is between you and `graph.microsoft.com`. The tool retries
 transport errors with backoff and, on exhaustion, prints an actionable message
-instead of a traceback. To get through:
+instead of a traceback; a `200` that is not JSON (a proxy login page) is reported
+the same way. To get through:
 
 ```powershell
 # PowerShell — point the tool (and MSAL) at your proxy
@@ -153,18 +175,20 @@ users, or export the two collections elsewhere and analyse them with
 |---|---|---|
 | `ACS_URL_ACCEPTED` | CRITICAL | A `--check-acs-url` candidate exactly matches a registered reply URL. Entra would deliver the assertion there — this app is affected by that specific URL. |
 | `ACS_URL_ACCEPTED_VIA_WILDCARD` | CRITICAL | A `--check-acs-url` candidate is covered by a wildcard reply URL. |
-| `DANGLING_DNS` | CRITICAL | Registered reply URL host does not resolve. Whoever claims the name receives assertions for this app. |
+| `DANGLING_DNS` | CRITICAL | Registered reply URL host does not resolve. Whoever claims the name receives assertions for this app. HIGH when it is only the logout URL. |
 | `WILDCARD_REPLY_URL` | CRITICAL | Wildcard in the reply URL — the exact-match allowlist no longer constrains delivery. |
 | `CNAME_TO_CLAIMABLE_SERVICE` | HIGH | CNAME chain terminates in a takeover-prone namespace. |
 | `TAKEOVER_PRONE_NAMESPACE` | HIGH | Host itself sits in a claimable namespace (`*.azurewebsites.net`, `*.herokuapp.com`, S3, etc.). |
 | `NON_HTTPS` | HIGH | Assertion or authorization code would traverse cleartext. Loopback is excluded. |
 | `SAML_UNSIGNED_REQUESTS_ACCEPTED` | MEDIUM | `requestSignatureVerification.isSignedRequestRequired` is not `true`. The allowlist is the only control. |
-| `SIGNING_ENFORCED_NO_VERIFY_CERT` | MEDIUM | Signed requests required but no `keyCredential` with `usage=Verify`. |
+| `SIGNING_ENFORCED_NO_VERIFY_CERT` | MEDIUM | Signed requests required but no currently valid `keyCredential` with `usage=Verify`. Expired and not-yet-valid certificates don't count; a missing or unreadable date counts as valid. |
 | `UNVERIFIED_DOMAIN` | MEDIUM / LOW | Host is not under a domain verified in this tenant. Expected for SaaS; confirm the recipient is intended. |
 | `LOOPBACK_OR_PRIVATE` | MEDIUM / LOW | Loopback or RFC1918 host registered. Leftover dev config, and a candidate target when no explicit ACS URL is supplied. |
 | `USERINFO_IN_URL` | MEDIUM | URL contains a userinfo component. |
-| `LARGE_REPLY_URL_SURFACE` | LOW | 10+ registered URLs. Each is a permitted delivery target. |
-| `DISABLED_SP_WITH_URLS` | LOW | Service principal disabled but reply URLs remain. |
+| `LARGE_REPLY_URL_SURFACE` | LOW | 10+ registered reply/redirect URLs. Each is a permitted delivery target. The logout URL is not counted. |
+| `DISABLED_SP_WITH_URLS` | LOW | Service principal disabled but reply/redirect URLs remain (a logout URL alone does not count). |
+| `UNUSUAL_SCHEME` | LOW | Scheme is neither http nor https, or missing, and is not a known native/broker scheme (`ms-appx-web`, `msauth`, `msal`, `urn:ietf:wg:oauth`). |
+| `UNPARSEABLE_URL` | LOW | URL cannot be parsed (e.g. broken IPv6 literal, port out of range). Reported once, without further URL checks that need a parsed scheme. |
 | `MULTITENANT_APP` | INFO | App owned by another tenant; hygiene is the vendor's responsibility. |
 
 `DANGLING_DNS` and `WILDCARD_REPLY_URL` are the two that mean *act today*. `SAML_UNSIGNED_REQUESTS_ACCEPTED` on its own will fire across most of the estate — treat it as a hardening backlog, not an incident.
@@ -201,3 +225,6 @@ Runs the detection logic against synthetic Graph responses. No tenant or network
 - `preferredSingleSignOnMode` is not always populated for gallery apps, so SAML capability is inferred from SSO mode *or* SSO-related service principal tags. Some SAML apps may be classified as non-SAML.
 - The takeover-namespace list is conservative, not exhaustive. Extend `TAKEOVER_SUFFIXES` for your environment.
 - DNS resolution reflects the resolver's view. Run from a host with the same egress as your users before concluding a name is dangling; split-horizon DNS produces false positives.
+- Only `NXDOMAIN` or a name with no address counts as dangling. Timeouts and server failures are reported as `dns=error` and counted in the progress log, never as `DANGLING_DNS`.
+- IP literals, `localhost`, and single-label names (`https://intranet/...`) are not resolved: public DNS cannot answer for them, so querying would only produce false `DANGLING_DNS` findings.
+- Every app is DNS-checked, including apps with no other finding; an app is dropped from the report only after DNS has run.

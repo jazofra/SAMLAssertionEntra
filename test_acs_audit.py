@@ -4,14 +4,23 @@
     python3 test_acs_audit.py
 """
 
+import contextlib
+import io
+import json
+import os
 import sys
+import tempfile
 
+import acs_audit
 from acs_audit import (
     acs_candidate_match,
     build_records,
+    finding_counts,
     flatten,
     normalise_for_match,
     print_console,
+    resolve_host,
+    retry_delay,
 )
 
 TENANT_ID = "11111111-1111-1111-1111-111111111111"
@@ -104,6 +113,23 @@ def test_match_helpers() -> bool:
         print("FAIL - normalise_for_match did not canonicalise host/port/path")
         ok = False
 
+    # The query string is part of the exact match: /acs and /acs?x=1 are
+    # different reply URLs, in either direction.
+    query_cases = [
+        ("https://sp.contoso.com/acs", "https://sp.contoso.com/acs?x=1", None),
+        ("https://sp.contoso.com/acs?x=1", "https://sp.contoso.com/acs", None),
+        ("https://sp.contoso.com/acs?x=1", "https://SP.contoso.com:443/acs?x=1", "exact"),
+        ("https://sp.contoso.com/acs?x=1", "https://sp.contoso.com/acs?X=1", None),
+        # A wildcard stays permissive: an appended query does not escape it.
+        ("https://*.dev.contoso.com/saml/acs", "https://a.dev.contoso.com/saml/acs?x=1", "wildcard"),
+    ]
+    for registered, candidate, expected in query_cases:
+        got = acs_candidate_match(registered, candidate)
+        if got != expected:
+            print(f"FAIL - acs_candidate_match({registered!r}, {candidate!r}) = {got!r}, "
+                  f"expected {expected!r}")
+            ok = False
+
     return ok
 
 
@@ -149,6 +175,204 @@ def test_saml_only() -> bool:
     return True
 
 
+def test_malformed_and_logout_urls() -> bool:
+    ok = True
+
+    # Malformed reply URLs are reported, not fatal - even with ACS candidates,
+    # which normalise every registered URL.
+    sps = [{"id": "sp-x", "appId": "app-x", "displayName": "Broken", "tags": [],
+            "replyUrls": ["http://[::1/acs", "https://h.contoso.com:99999/acs"]}]
+    try:
+        records = build_records(sps, [], OWNED, TENANT_ID, include_all=False,
+                                acs_candidates=["https://attacker.oast.me/saml/acs"])
+    except ValueError as exc:
+        print(f"FAIL - malformed reply URL crashed the run: {exc}")
+        return False
+    codes = {f.code for r in records for u in r.urls for f in u.findings}
+    if "UNPARSEABLE_URL" not in codes:
+        print("FAIL - malformed reply URL was not reported as UNPARSEABLE_URL")
+        ok = False
+
+    # The logout URL never receives an assertion, so it is not an ACS match.
+    apps = [{"id": "a-x", "appId": "app-y", "displayName": "Logout Only",
+             "web": {"redirectUris": [], "logoutUrl": "https://sp.contoso.com/logout"}}]
+    records = build_records([], apps, OWNED, TENANT_ID, include_all=False,
+                            acs_candidates=["https://sp.contoso.com/logout"])
+    if any(f.code.startswith("ACS_URL_ACCEPTED") for r in records for u in r.urls
+           for f in u.findings):
+        print("FAIL - logout URL was reported as an accepted ACS URL")
+        ok = False
+
+    return ok
+
+
+def test_rule_refinements() -> bool:
+    ok = True
+
+    def url_codes(records, url):
+        return {f.code for r in records for u in r.urls if u.url == url for f in u.findings}
+
+    # An unparseable URL is reported once, not also as UNUSUAL_SCHEME; a URL
+    # that parses but has no scheme says so.
+    sps = [{"id": "sp-u", "appId": "app-u", "displayName": "Odd URLs", "tags": [],
+            "replyUrls": ["http://[::1/acs", "sp.contoso.com/acs"]}]
+    records = build_records(sps, [], OWNED, TENANT_ID, include_all=True)
+    if url_codes(records, "http://[::1/acs") != {"UNPARSEABLE_URL"}:
+        print(f"FAIL - unparseable URL codes: {url_codes(records, 'http://[::1/acs')}")
+        ok = False
+    details = [f.detail for r in records for u in r.urls if u.url == "sp.contoso.com/acs"
+               for f in u.findings if f.code == "UNUSUAL_SCHEME"]
+    if details != ["URL has no scheme"]:
+        print(f"FAIL - scheme-less URL not reported as such: {details}")
+        ok = False
+
+    # Signed requests required: only a currently valid Verify cert counts.
+    def signing_codes(key_credentials):
+        sp = {"id": "sp-s", "appId": "app-s", "displayName": "Signed", "tags": [],
+              "preferredSingleSignOnMode": "saml", "replyUrls": ["https://s.contoso.com/acs"]}
+        app = {"id": "a-s", "appId": "app-s",
+               "requestSignatureVerification": {"isSignedRequestRequired": True},
+               "keyCredentials": key_credentials}
+        recs = build_records([sp], [app], OWNED, TENANT_ID, include_all=True)
+        return {f.code for r in recs for f in r.findings}
+
+    cert_cases = [
+        ([{"usage": "Verify", "endDateTime": "2020-01-01T00:00:00Z"}], True),           # expired
+        ([{"usage": "Verify", "startDateTime": "2999-01-01T00:00:00Z"}], True),         # not yet valid
+        ([{"usage": "Verify", "endDateTime": "2999-01-01T00:00:00.1234567Z"}], False),  # valid, 7 digits
+        ([{"usage": "Verify", "endDateTime": "not a date"}], False),                    # unreadable
+        ([{"usage": "Verify", "endDateTime": "2020-01-01T00:00:00Z"},
+          {"usage": "Verify", "endDateTime": "2999-01-01T00:00:00Z"}], False),          # one still valid
+        ([{"usage": "Sign", "endDateTime": "2999-01-01T00:00:00Z"}], True),             # wrong usage
+    ]
+    for creds, should_fire in cert_cases:
+        fired = "SIGNING_ENFORCED_NO_VERIFY_CERT" in signing_codes(creds)
+        if fired != should_fire:
+            print(f"FAIL - SIGNING_ENFORCED_NO_VERIFY_CERT fired={fired} for {creds}")
+            ok = False
+
+    # The logout URL counts towards neither the URL-surface threshold nor the
+    # "disabled SP still has reply URLs" check.
+    def app_codes(redirect_count, enabled=True):
+        sp = {"id": "sp-l", "appId": "app-l", "displayName": "Logout", "tags": [],
+              "accountEnabled": enabled, "replyUrls": []}
+        app = {"id": "a-l", "appId": "app-l", "web": {
+            "redirectUris": [f"https://r{i}.contoso.com/cb" for i in range(redirect_count)],
+            "logoutUrl": "https://sp.contoso.com/logout"}}
+        recs = build_records([sp], [app], OWNED, TENANT_ID, include_all=True)
+        return {f.code for r in recs for f in r.findings}
+
+    if "LARGE_REPLY_URL_SURFACE" in app_codes(9):
+        print("FAIL - 9 redirect URIs plus a logout URL tripped LARGE_REPLY_URL_SURFACE")
+        ok = False
+    if "LARGE_REPLY_URL_SURFACE" not in app_codes(10):
+        print("FAIL - 10 redirect URIs did not trip LARGE_REPLY_URL_SURFACE")
+        ok = False
+    if "DISABLED_SP_WITH_URLS" in app_codes(0, enabled=False):
+        print("FAIL - disabled SP with only a logout URL reported DISABLED_SP_WITH_URLS")
+        ok = False
+    if "DISABLED_SP_WITH_URLS" not in app_codes(1, enabled=False):
+        print("FAIL - disabled SP with a redirect URI did not report DISABLED_SP_WITH_URLS")
+        ok = False
+
+    return ok
+
+
+def test_dns_host_selection() -> bool:
+    # None of these can be answered by public DNS; querying them would turn
+    # into a false DANGLING_DNS. resolve_host must skip them without a lookup.
+    for host in ("localhost", "app.localhost", "8.8.8.8", "::1", "10.0.0.5",
+                 "intranet", "*.contoso.com", ""):
+        status, _ = resolve_host(host)
+        if status != "skipped":
+            print(f"FAIL - resolve_host({host!r}) returned {status!r}, expected 'skipped'")
+            return False
+    return True
+
+
+def test_retry_delay() -> bool:
+    class Resp:
+        def __init__(self, headers):
+            self.headers = headers
+
+    cases = [
+        (Resp({"Retry-After": "7"}), 1, 7.0),
+        (Resp({"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"}), 1, 0.0),  # date in the past
+        (Resp({"Retry-After": "99999"}), 1, 120.0),                         # capped
+        (Resp({"Retry-After": "soon"}), 3, 4.0),                            # unparseable -> backoff
+        (None, 6, 30.0),                                                    # transport error
+    ]
+    for resp, attempt, expected in cases:
+        got = retry_delay(resp, attempt)
+        if got != expected:
+            print(f"FAIL - retry_delay({resp and resp.headers}, {attempt}) = {got}, expected {expected}")
+            return False
+    return True
+
+
+def test_include_clean_and_counts() -> bool:
+    ok = True
+    records = build_records(SPS, APPS, OWNED, TENANT_ID, include_all=True)
+    rows = flatten(records)
+    clean_rows = [r for r in rows if r["app"] == "Finance SAML"]
+    if not clean_rows or any(r["severity"] != "CLEAN" for r in clean_rows):
+        print(f"FAIL - --include-clean did not emit CLEAN rows for the clean app: {clean_rows}")
+        ok = False
+
+    # App-level codes count once per app, not once per URL row.
+    unsigned = finding_counts(records)["SAML_UNSIGNED_REQUESTS_ACCEPTED"]
+    if unsigned != 3:
+        print(f"FAIL - SAML_UNSIGNED_REQUESTS_ACCEPTED counted {unsigned} times, expected 3 apps")
+        ok = False
+    return ok
+
+
+def test_end_to_end_dump() -> bool:
+    """main() on a dump: DNS must run before clean apps are dropped, so a
+    hardened app whose only problem is a dangling reply URL is still reported."""
+    dangling = "finance.contoso.com"
+    fake_dns = lambda host, timeout=5.0: (("nxdomain", []) if host == dangling
+                                          else ("resolves", []))
+    with tempfile.TemporaryDirectory() as tmp:
+        dump = os.path.join(tmp, "dump.json")
+        out_json = os.path.join(tmp, "findings.json")
+        out_csv = os.path.join(tmp, "findings.csv")
+        # UTF-16 with BOM, as Windows PowerShell 5.1 `>` redirection writes it.
+        with open(dump, "w", encoding="utf-16") as fh:
+            json.dump({"tenantId": TENANT_ID, "verifiedDomains": sorted(OWNED),
+                       "servicePrincipals": SPS, "applications": APPS}, fh)
+
+        argv = ["acs_audit.py", "--from-dump", dump, "--out-json", out_json,
+                "--out-csv", out_csv, "--fail-on", "CRITICAL"]
+        saved = sys.argv, acs_audit.resolve_host
+        sys.argv, acs_audit.resolve_host = argv, fake_dns
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                rc = acs_audit.main()
+        finally:
+            sys.argv, acs_audit.resolve_host = saved
+
+        with open(out_json, encoding="utf-8") as fh:
+            report = json.load(fh)
+        with open(out_csv, encoding="utf-8") as fh:
+            csv_text = fh.read()
+
+    if rc != 2:
+        print(f"FAIL - --fail-on CRITICAL returned {rc}, expected 2")
+        return False
+    finance = [a for a in report["applications"] if a["display_name"] == "Finance SAML"]
+    if not finance or finance[0]["severity"] != "CRITICAL" or not any(
+        f["code"] == "DANGLING_DNS" for u in finance[0]["urls"] for f in u["findings"]
+    ):
+        print("FAIL - dangling reply URL on an otherwise clean app was not reported")
+        return False
+    if "Finance SAML" not in csv_text or not csv_text.startswith("severity,app,appId"):
+        print("FAIL - CSV output missing the dangling-DNS row or its header")
+        return False
+    return True
+
+
 def main() -> int:
     records = build_records(SPS, APPS, OWNED, TENANT_ID, include_all=False)
     rows = flatten(records)
@@ -186,9 +410,25 @@ def main() -> int:
         return 1
     if not test_saml_only():
         return 1
+    if not test_malformed_and_logout_urls():
+        return 1
+    if not test_rule_refinements():
+        return 1
+    if not test_dns_host_selection():
+        return 1
+    if not test_retry_delay():
+        return 1
+    if not test_include_clean_and_counts():
+        return 1
+    if not test_end_to_end_dump():
+        return 1
 
     print("PASS - all expected detections fired, hardened app is clean")
     print("PASS - injected ACS URL check, wildcard match, and --saml-only behave correctly")
+    print("PASS - malformed URLs, DNS host selection, retry delays, --include-clean and "
+          "end-to-end dump run behave correctly")
+    print("PASS - query-string matching, scheme reporting, Verify cert validity and "
+          "logout-URL exclusions behave correctly")
     return 0
 
 
