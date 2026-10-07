@@ -35,20 +35,27 @@ Usage
   # delegated, interactive (device code)
   python acs_audit.py --tenant contoso.onmicrosoft.com --device-code
 
-  # app-only
+  # app-only, client secret (or set $AZURE_CLIENT_SECRET instead of the flag)
   python acs_audit.py --tenant <tenant-id> --client-id <id> --client-secret <secret>
+
+  # app-only, certificate (PEM with key + cert, or PFX)
+  python acs_audit.py --tenant <tenant-id> --client-id <id> --client-cert app.pem
 
   # bring your own token
   GRAPH_TOKEN=eyJ0... python acs_audit.py --tenant <tenant-id>
 
 Required Graph permissions (read only):
   Application.Read.All, Directory.Read.All
+  (Application.Read.All alone works; without Directory.Read.All the tenant's
+  verified domains cannot be read, so pass --owned-domains.)
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
+import getpass
 import ipaddress
 import json
 import os
@@ -78,6 +85,14 @@ except ImportError:  # pragma: no cover
     HAVE_DNSPYTHON = False
 
 GRAPH = "https://graph.microsoft.com/v1.0"
+# National clouds: (sign-in host, Graph root). GCC (Moderate) tenants live in
+# the global cloud; GCC High and DoD have their own sign-in and Graph hosts.
+CLOUDS = {
+    "global": ("login.microsoftonline.com", "https://graph.microsoft.com"),
+    "usgov": ("login.microsoftonline.us", "https://graph.microsoft.us"),
+    "usgov-dod": ("login.microsoftonline.us", "https://dod-graph.microsoft.us"),
+    "china": ("login.chinacloudapi.cn", "https://microsoftgraph.chinacloudapi.cn"),
+}
 # Microsoft Graph Command Line Tools - public client, usable for device code flow.
 DEFAULT_PUBLIC_CLIENT_ID = "14d82eec-204b-4c2f-b7e8-296a70dab67e"
 
@@ -132,6 +147,14 @@ LOGOUT_SOURCE = "app.web.logoutUrl"
 
 GUID_RE = re.compile(r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}", re.IGNORECASE)
 
+# Display names and reply URLs of apps owned by other tenants are chosen by
+# whoever published the app, so treat them as hostile when writing reports.
+# Spreadsheet apps execute a CSV cell that starts with one of these.
+CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+# C0/C1 control characters (terminal escape sequences) and bidi overrides
+# (text that renders in a different order from how it reads).
+UNSAFE_CONSOLE_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
 GRAPH_ATTEMPTS = 6
 
 
@@ -139,6 +162,10 @@ def log(msg: str) -> None:
     """Always-on progress line to stderr, flushed immediately so the user sees
     each phase as it happens rather than after a long silent buffer."""
     print(f"[*] {msg}", file=sys.stderr, flush=True)
+
+
+def warn(msg: str) -> None:
+    print(f"[!] {msg}", file=sys.stderr, flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -149,10 +176,11 @@ class GraphClient:
         self,
         token: str,
         timeout: int = 60,
-        verbose: bool = False,
         proxy: str | None = None,
         ca_bundle: str | None = None,
+        graph: str = GRAPH,
     ):
+        self.graph = graph
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -169,7 +197,6 @@ class GraphClient:
         if ca_bundle:
             self.session.verify = ca_bundle
         self.timeout = timeout
-        self.verbose = verbose
 
     def get(self, url: str, params: dict | None = None) -> dict:
         for attempt in range(1, GRAPH_ATTEMPTS + 1):
@@ -188,15 +215,14 @@ class GraphClient:
                         0,
                         f"connection to Graph failed after {GRAPH_ATTEMPTS} attempts "
                         f"({type(exc).__name__}: {exc}). If auth succeeded but this call did "
-                        f"not, a proxy/firewall or TLS inspection is likely blocking {GRAPH}. "
+                        f"not, a proxy/firewall or TLS inspection is likely blocking {self.graph}. "
                         f"Set HTTPS_PROXY (or --proxy) and, for TLS interception, "
                         f"REQUESTS_CA_BUNDLE (or --ca-bundle).",
                         url,
                     ) from exc
                 wait = retry_delay(None, attempt)
-                if self.verbose:
-                    print(f"[!] {type(exc).__name__} talking to Graph, retrying in {wait:.0f}s "
-                          f"(attempt {attempt}/{GRAPH_ATTEMPTS})", file=sys.stderr)
+                warn(f"{type(exc).__name__} talking to Graph, retrying in {wait:.0f}s "
+                     f"(attempt {attempt}/{GRAPH_ATTEMPTS})")
                 time.sleep(wait)
                 continue
 
@@ -206,9 +232,10 @@ class GraphClient:
                                      f"still failing after {GRAPH_ATTEMPTS} attempts: "
                                      f"{resp.text[:1000]}", url)
                 wait = retry_delay(resp, attempt)
-                if self.verbose:
-                    print(f"[!] {resp.status_code} from Graph, retrying in {wait:.0f}s "
-                          f"(attempt {attempt}/{GRAPH_ATTEMPTS})", file=sys.stderr)
+                # Always shown: a Retry-After of up to two minutes otherwise
+                # looks like the run has hung.
+                warn(f"{resp.status_code} from Graph, retrying in {wait:.0f}s "
+                     f"(attempt {attempt}/{GRAPH_ATTEMPTS})")
                 time.sleep(wait)
                 continue
             if not resp.ok:
@@ -226,7 +253,7 @@ class GraphClient:
 
     def paged(self, path: str, params: dict | None = None,
               label: str | None = None) -> Iterable[dict]:
-        url = f"{GRAPH}{path}"
+        url = f"{self.graph}{path}"
         first = True
         page = 0
         total = 0
@@ -272,33 +299,112 @@ def retry_delay(resp: requests.Response | None, attempt: int) -> float:
 # ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
+def load_client_certificate(path: str) -> dict[str, str]:
+    """MSAL client_credential for certificate auth, from a PEM file holding the
+    private key and certificate (what `az ad sp create-for-rbac --create-cert`
+    writes) or a PFX/P12. A password, if the key needs one, comes from
+    $AZURE_CLIENT_CERTIFICATE_PASSWORD or an interactive prompt - never from
+    the command line, where it would land in shell history."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.serialization import pkcs12
+
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError as exc:
+        sys.exit(f"[!] cannot read --client-cert {path}: {exc.strerror or exc}")
+
+    def password() -> bytes:
+        pw = os.environ.get("AZURE_CLIENT_CERTIFICATE_PASSWORD")
+        if pw is None and sys.stdin.isatty():
+            pw = getpass.getpass(f"password for {path}: ")
+        if pw is None:
+            sys.exit(f"[!] {path} is password-protected; set AZURE_CLIENT_CERTIFICATE_PASSWORD")
+        return pw.encode()
+
+    try:
+        if b"-----BEGIN" in data:
+            key_pem = re.search(rb"-----BEGIN [A-Z ]*PRIVATE KEY-----.+?-----END [A-Z ]*PRIVATE KEY-----",
+                                data, re.DOTALL)
+            cert_pem = re.search(rb"-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----",
+                                 data, re.DOTALL)
+            if not key_pem or not cert_pem:
+                sys.exit(f"[!] {path} must contain both the private key and the certificate (PEM)")
+            encrypted = b"ENCRYPTED" in key_pem.group()
+            key = serialization.load_pem_private_key(key_pem.group(),
+                                                     password() if encrypted else None)
+            cert = x509.load_pem_x509_certificate(cert_pem.group())
+        else:
+            try:
+                key, cert, _ = pkcs12.load_key_and_certificates(data, None)
+            except ValueError:
+                key, cert, _ = pkcs12.load_key_and_certificates(data, password())
+            if key is None or cert is None:
+                sys.exit(f"[!] {path} must contain both the private key and the certificate")
+    except (TypeError, ValueError) as exc:
+        sys.exit(f"[!] cannot load --client-cert {path}: {exc}")
+
+    # MSAL takes an unencrypted PEM key plus the certificate's SHA-1 thumbprint,
+    # the form every supported MSAL version accepts.
+    return {
+        "private_key": key.private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ).decode(),
+        "thumbprint": cert.fingerprint(hashes.SHA1()).hex().upper(),
+    }
+
+
 def acquire_token(args: argparse.Namespace) -> str:
+    """Credential precedence: --access-token; then, if the command line names a
+    sign-in (--client-id, --client-cert, --client-secret, --device-code), that
+    sign-in; then $GRAPH_TOKEN; then device code. With --client-id and no other
+    credential, $AZURE_CLIENT_SECRET selects app-only sign-in. The command line
+    beats the environment, so a stale $GRAPH_TOKEN cannot silently replace the
+    credentials the operator typed."""
     if args.access_token:
-        return args.access_token
-    env = os.environ.get("GRAPH_TOKEN")
-    if env:
-        return env
+        log("auth: using --access-token")
+        return strip_bearer(args.access_token)
+    explicit = args.client_id or args.client_cert or args.client_secret or args.device_code
+    env_token = os.environ.get("GRAPH_TOKEN")
+    if env_token and not explicit:
+        log("auth: using the token in $GRAPH_TOKEN")
+        return strip_bearer(env_token)
 
     try:
         import msal
     except ImportError:
         sys.exit("missing dependency: pip install msal (or pass --access-token / $GRAPH_TOKEN)")
 
-    authority = f"https://login.microsoftonline.com/{args.tenant}"
-    scope = ["https://graph.microsoft.com/.default"]
+    login_host, graph_root = CLOUDS[args.cloud]
+    authority = f"https://{login_host}/{args.tenant}"
+    scope = [f"{graph_root}/.default"]
     # Send sign-in through the same proxy / CA bundle as the Graph calls; without
-    # this, --proxy and --ca-bundle get past Graph but not login.microsoftonline.com.
+    # this, --proxy and --ca-bundle get past Graph but not the sign-in host.
     transport: dict[str, Any] = {"verify": args.ca_bundle or True}
     if args.proxy:
         transport["proxies"] = {"http": args.proxy, "https": args.proxy}
 
-    if args.client_secret:
+    credential: str | dict[str, str] | None = None
+    if args.client_cert:
+        credential = load_client_certificate(args.client_cert)
+        log(f"auth: app-only, certificate {credential['thumbprint']}")
+    elif args.client_secret:
+        credential = args.client_secret
+        log("auth: app-only, client secret")
+    elif args.client_id and not args.device_code and os.environ.get("AZURE_CLIENT_SECRET"):
+        credential = os.environ["AZURE_CLIENT_SECRET"]
+        log("auth: app-only, client secret from $AZURE_CLIENT_SECRET")
+
+    if credential:
         app = msal.ConfidentialClientApplication(
-            args.client_id, authority=authority, client_credential=args.client_secret,
+            args.client_id, authority=authority, client_credential=credential,
             **transport,
         )
         result = app.acquire_token_for_client(scopes=scope)
     else:
+        log("auth: device code (delegated)")
         client_id = args.client_id or DEFAULT_PUBLIC_CLIENT_ID
         app = msal.PublicClientApplication(client_id, authority=authority, **transport)
         flow = app.initiate_device_flow(scopes=scope)
@@ -310,6 +416,41 @@ def acquire_token(args: argparse.Namespace) -> str:
     if "access_token" not in result:
         sys.exit(f"token acquisition failed: {result.get('error_description', result)}")
     return result["access_token"]
+
+
+def strip_bearer(token: str) -> str:
+    """Accept a token pasted together with its "Bearer " prefix."""
+    token = token.strip()
+    return token[7:].strip() if token[:7].lower() == "bearer " else token
+
+
+def token_claims(token: str) -> dict[str, Any]:
+    """The unverified JWT payload of an access token, or {} if it is not a
+    readable JWT. Used for diagnostics only - Graph does the real validation."""
+    try:
+        payload = token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    except (IndexError, ValueError):
+        return {}
+    return claims if isinstance(claims, dict) else {}
+
+
+def check_token(claims: dict[str, Any], tenant: str) -> str | None:
+    """Stop before auditing with a token that is expired or was issued for a
+    different tenant than --tenant (a stale $GRAPH_TOKEN would otherwise audit
+    the wrong tenant under the right name). Returns the token's tenant ID."""
+    exp = claims.get("exp")
+    if isinstance(exp, (int, float)) and exp <= time.time():
+        expired = datetime.fromtimestamp(exp, timezone.utc).isoformat(timespec="seconds")
+        sys.exit(f"[!] the access token expired at {expired}; get a fresh one")
+    tid = claims.get("tid")
+    if not isinstance(tid, str) or not GUID_RE.fullmatch(tid):
+        return None
+    tid = tid.lower()
+    if GUID_RE.fullmatch(tenant) and tenant.lower() != tid:
+        sys.exit(f"[!] the access token was issued for tenant {tid}, not --tenant {tenant}; "
+                 "refusing to audit a different tenant than the one named")
+    return tid
 
 
 # ---------------------------------------------------------------------------
@@ -366,11 +507,19 @@ class AppRecord:
 # Collection
 # ---------------------------------------------------------------------------
 def fetch_verified_domains(client: GraphClient) -> set[str]:
-    domains = set()
-    for d in client.paged("/domains"):
-        if d.get("isVerified"):
-            domains.add(d["id"].lower())
-    return domains
+    """The tenant's verified domains, or an empty set when the token may not
+    read them (Application.Read.All without Directory.Read.All). Losing the
+    ownership baseline costs one finding type; aborting would throw away the
+    enumeration that has already run."""
+    try:
+        return {d["id"].lower() for d in client.paged("/domains")
+                if d.get("isVerified") and d.get("id")}
+    except GraphError as e:
+        if e.status not in (401, 403):
+            raise
+        warn(f"cannot read the tenant's domains (Graph {e.status}; needs Directory.Read.All) - "
+             "pass --owned-domains to enable UNVERIFIED_DOMAIN")
+        return set()
 
 
 def fetch_service_principals(client: GraphClient) -> list[dict]:
@@ -409,7 +558,7 @@ def fetch_applications(client: GraphClient) -> list[dict]:
 
 def fetch_tenant_id(client: GraphClient) -> str | None:
     try:
-        org = client.get(f"{GRAPH}/organization")
+        org = client.get(f"{client.graph}/organization")
         vals = org.get("value") or []
         return vals[0]["id"] if vals else None
     except GraphError:
@@ -446,6 +595,12 @@ def load_dump(path: str) -> tuple[list[dict], list[dict], str | None, set[str]]:
         sys.exit(f"[!] {path}: expected a JSON object with 'servicePrincipals'/'applications' keys")
     sps = data.get("servicePrincipals") or data.get("service_principals") or []
     apps = data.get("applications") or data.get("apps") or []
+
+    def unwrap(x: Any) -> Any:
+        # Also accept a raw Graph page ({"value": [...]}) pasted in as either array.
+        return x["value"] if isinstance(x, dict) and isinstance(x.get("value"), list) else x
+
+    sps, apps = unwrap(sps), unwrap(apps)
     if not isinstance(sps, list) or not isinstance(apps, list):
         sys.exit(f"[!] {path}: 'servicePrincipals' and 'applications' must be JSON arrays")
     tenant_id = data.get("tenantId") or data.get("tenant_id")
@@ -457,6 +612,24 @@ def load_dump(path: str) -> tuple[list[dict], list[dict], str | None, set[str]]:
     return sps, apps, tenant_id, domains
 
 
+def write_dump(path: str, sps: list[dict], apps: list[dict], tenant_id: str | None,
+               verified_domains: set[str]) -> None:
+    """Save the raw Graph collections in the shape load_dump() reads, so the
+    analysis can be repeated offline (other --check-acs-url values, another
+    analyst without tenant access) without signing in again."""
+    payload = {
+        "_comment": "Raw Microsoft Graph export written by acs_audit.py --save-dump; "
+                    "analyse it with --from-dump.",
+        "exportedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "tenantId": tenant_id,
+        "verifiedDomains": sorted(verified_domains),
+        "servicePrincipals": sps,
+        "applications": apps,
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+
+
 # ---------------------------------------------------------------------------
 # URL analysis
 # ---------------------------------------------------------------------------
@@ -465,7 +638,9 @@ def parse_url(raw: str, source: str) -> UrlRecord:
     try:
         parts = urlsplit(raw)
         rec.scheme = (parts.scheme or "").lower()
-        rec.host = (parts.hostname or "").lower()
+        # "sp.contoso.com." is the same host as "sp.contoso.com"; without this
+        # the trailing dot slips past the namespace and owned-domain checks.
+        rec.host = (parts.hostname or "").lower().rstrip(".")
         rec.port = parts.port
         rec.path = parts.path or ""
     except ValueError:
@@ -524,11 +699,36 @@ def acs_candidate_match(registered: str, candidate: str) -> str | None:
              normalise_for_match(candidate, keep_query=False)),
         )
         for pattern, target in comparisons:
-            if re.fullmatch(re.escape(pattern).replace(r"\*", ".*"), target):
+            if glob_match(pattern, target):
                 return "wildcard"
     if registered == candidate or norm_registered == norm_candidate:
         return "exact"
     return None
+
+
+def glob_match(pattern: str, text: str) -> bool:
+    """Does `text` match `pattern`, where `*` matches any run of characters
+    (including none) and everything else is literal? Greedy two-pointer match,
+    O(len(pattern) * len(text)) at worst. A regex built from a reply URL with
+    many wildcards backtracks exponentially, and reply URLs of apps owned by
+    other tenants are chosen by their publisher, so one hostile entry could
+    stall the run."""
+    p = t = 0
+    star, mark = -1, 0
+    while t < len(text):
+        if p < len(pattern) and pattern[p] == "*":
+            star, mark = p, t
+            p += 1
+        elif p < len(pattern) and pattern[p] == text[t]:
+            p += 1
+            t += 1
+        elif star >= 0:
+            # Let the last `*` absorb one more character and retry from there.
+            mark += 1
+            p, t = star + 1, mark
+        else:
+            return False
+    return pattern[p:].strip("*") == ""
 
 
 def takeover_suffix(host: str) -> str | None:
@@ -538,16 +738,26 @@ def takeover_suffix(host: str) -> str | None:
     return None
 
 
-def is_private_host(host: str) -> bool:
+def ip_literal(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
     try:
-        ip = ipaddress.ip_address(host)
+        return ipaddress.ip_address(host)
     except ValueError:
-        return False
-    return ip.is_private or ip.is_loopback or ip.is_link_local
+        return None
+
+
+def is_private_host(host: str) -> bool:
+    ip = ip_literal(host)
+    return bool(ip and (ip.is_private or ip.is_loopback or ip.is_link_local))
 
 
 def is_loopback_name(host: str) -> bool:
     return host == "localhost" or host.endswith(".localhost")
+
+
+def is_loopback_host(host: str) -> bool:
+    """Traffic to this host never leaves the machine."""
+    ip = ip_literal(host)
+    return is_loopback_name(host) or bool(ip and ip.is_loopback)
 
 
 def has_userinfo(raw: str) -> bool:
@@ -564,7 +774,9 @@ def analyse_url(
     acs_candidates: list[str] | None = None,
 ) -> None:
     raw = rec.url
-    loopback = is_loopback_name(rec.host) or is_private_host(rec.host)
+    loopback = is_loopback_host(rec.host)
+    local = loopback or is_private_host(rec.host)
+    public_ip = not local and ip_literal(rec.host) is not None
     # parse_url already reported it; its scheme is empty only because parsing
     # failed, so judging the scheme would just add noise.
     unparseable = any(f.code == "UNPARSEABLE_URL" for f in rec.findings)
@@ -597,7 +809,8 @@ def analyse_url(
         )
 
     # Cleartext over loopback is normal for local development, so only flag it
-    # where the traffic would actually leave the machine.
+    # where the traffic would actually leave the machine - which includes
+    # private and link-local addresses.
     if rec.scheme == "http" and not loopback:
         rec.findings.append(
             Finding("HIGH", "NON_HTTPS",
@@ -611,7 +824,7 @@ def analyse_url(
                     f"Non-HTTPS scheme '{rec.scheme}'" if rec.scheme else "URL has no scheme")
         )
 
-    if loopback:
+    if local:
         sev = "MEDIUM" if saml_capable else "LOW"
         rec.findings.append(
             Finding(sev, "LOOPBACK_OR_PRIVATE",
@@ -632,7 +845,15 @@ def analyse_url(
                     "provisioned and owned by you")
         )
 
-    if owned_domains and rec.host and not loopback \
+    if public_ip:
+        sev = "MEDIUM" if saml_capable else "LOW"
+        rec.findings.append(
+            Finding(sev, "IP_LITERAL_HOST",
+                    "Reply URL host is a public IP address - cloud IPs are released and "
+                    "reassigned, and neither DNS nor domain ownership can vouch for it")
+        )
+
+    if owned_domains and rec.host and not local and not public_ip \
             and not registrable_match(rec.host, owned_domains):
         sev = "MEDIUM" if saml_capable else "LOW"
         rec.findings.append(
@@ -732,6 +953,12 @@ def run_dns_checks(apps: list[AppRecord], workers: int, verbose: bool) -> None:
             results[host] = res
             if i % step == 0 or i == total:
                 log(f"  DNS: {i}/{total} hosts resolved")
+
+    if verbose:
+        for host, (status, chain) in results.items():
+            if status != "resolves":
+                via = f" via {' -> '.join(chain)}" if chain else ""
+                log(f"  DNS: {console_safe(host)}: {status}{via}")
 
     errors = sum(1 for status, _ in results.values() if status == "error")
     if errors:
@@ -980,6 +1207,20 @@ def finding_counts(records: list[AppRecord]) -> Counter:
     return counts
 
 
+def console_safe(text: Any) -> str:
+    """Render directory-sourced text inertly: control characters (terminal
+    escape sequences) and bidi overrides are shown as escapes instead."""
+    return UNSAFE_CONSOLE_RE.sub(lambda m: f"\\u{ord(m.group()):04x}", str(text))
+
+
+def csv_safe(value: Any) -> Any:
+    """Prefix a cell a spreadsheet would evaluate as a formula (OWASP CSV
+    injection guidance), e.g. a foreign app named '=HYPERLINK(...)'."""
+    if isinstance(value, str) and value.startswith(CSV_FORMULA_PREFIXES):
+        return "'" + value
+    return value
+
+
 def print_console(records: list[AppRecord], rows: list[dict], quiet_info: bool) -> None:
     print("\n=== Entra ID reply URL / SAML ACS exposure ===\n")
     for sev in REPORTED_SEVERITIES:
@@ -1000,14 +1241,14 @@ def print_console(records: list[AppRecord], rows: list[dict], quiet_info: bool) 
             continue
         print(f"--- {sev} ---")
         for r in subset:
-            print(f"  [{r['app']}]  ({r['appId']})")
+            print(f"  [{console_safe(r['app'])}]  ({console_safe(r['appId'])})")
             if r["url"]:
                 dns = f"  dns={r['dnsStatus']}" if r["dnsStatus"] not in ("unchecked", "skipped") else ""
-                print(f"      {r['url']}{dns}")
+                print(f"      {console_safe(r['url'])}{dns}")
                 if r["dnsChain"]:
-                    print(f"      cname: {r['dnsChain']}")
+                    print(f"      cname: {console_safe(r['dnsChain'])}")
             print(f"      {r['codes']}")
-            print(f"      {r['details']}")
+            print(f"      {console_safe(r['details'])}")
             print()
 
     code_counts = finding_counts(records)
@@ -1033,7 +1274,7 @@ def write_csv(path: str, rows: list[dict]) -> None:
     with open(path, "w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=CSV_FIELDS)
         w.writeheader()
-        w.writerows(rows)
+        w.writerows({k: csv_safe(v) for k, v in row.items()} for row in rows)
 
 
 # ---------------------------------------------------------------------------
@@ -1052,10 +1293,22 @@ def main() -> int:
     p.add_argument("--saml-only", action="store_true",
                    help="restrict the report to SAML-capable apps")
     p.add_argument("--client-id", help="app registration client ID")
-    p.add_argument("--client-secret", help="client secret (app-only flow; needs --client-id)")
+    p.add_argument("--client-secret",
+                   help="client secret (app-only flow; needs --client-id). Prefer setting "
+                        "$AZURE_CLIENT_SECRET, which keeps it out of shell history")
+    p.add_argument("--client-cert", metavar="FILE",
+                   help="certificate for app-only auth (needs --client-id): a PEM with the "
+                        "private key and certificate, or a PFX; a key password is read from "
+                        "$AZURE_CLIENT_CERTIFICATE_PASSWORD or prompted for")
     p.add_argument("--device-code", action="store_true",
                    help="interactive device code flow (the default when no secret or token is given)")
     p.add_argument("--access-token", help="pre-acquired Graph token (or set $GRAPH_TOKEN)")
+    p.add_argument("--cloud", choices=sorted(CLOUDS), default="global",
+                   help="national cloud of the tenant (default global; GCC Moderate is global, "
+                        "GCC High is usgov, DoD is usgov-dod)")
+    p.add_argument("--save-dump", metavar="FILE",
+                   help="also save the raw Graph data to FILE, for later offline runs with "
+                        "--from-dump")
     p.add_argument("--owned-domains", help="comma-separated domains you control; "
                                            "defaults to the tenant's verified domains")
     p.add_argument("--skip-dns", action="store_true", help="skip DNS resolution checks")
@@ -1071,15 +1324,28 @@ def main() -> int:
                                    "http://proxy:8080 (overrides HTTPS_PROXY for this run)")
     p.add_argument("--ca-bundle", help="path to a CA bundle to trust, for proxies that perform "
                                        "TLS inspection (overrides REQUESTS_CA_BUNDLE)")
-    p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="also list every registered host that did not resolve")
     args = p.parse_args()
 
     if not args.from_dump and not args.tenant:
         p.error("--tenant is required unless --from-dump is given")
-    if args.client_secret and not args.client_id:
-        p.error("--client-secret needs --client-id")
+    if args.from_dump and args.save_dump:
+        p.error("--save-dump saves live Graph data; it cannot be combined with --from-dump")
+    if args.client_secret and args.client_cert:
+        p.error("use either --client-secret or --client-cert, not both")
+    if (args.client_secret or args.client_cert) and not args.client_id:
+        p.error("--client-secret and --client-cert need --client-id")
+    if args.device_code and (args.client_secret or args.client_cert):
+        p.error("--device-code is delegated sign-in; it cannot be combined with "
+                "--client-secret or --client-cert")
     if args.dns_workers < 1:
         p.error("--dns-workers must be at least 1")
+    # Fail now rather than after sign-in, enumeration and DNS have run.
+    for flag, path in (("--out-json", args.out_json), ("--out-csv", args.out_csv),
+                       ("--save-dump", args.save_dump)):
+        if path and not os.path.isdir(os.path.dirname(os.path.abspath(path))):
+            p.error(f"{flag} {path}: directory does not exist")
 
     # Candidate ACS URLs may be repeated and/or comma-separated. Reject anything
     # that is not an absolute http(s) URL: it could never match a reply URL, and
@@ -1097,17 +1363,20 @@ def main() -> int:
             p.error(f"--check-acs-url {cand!r} must be an absolute http(s) URL, "
                     "e.g. https://attacker.example/saml/acs")
 
-    dump_domains: set[str] = set()
+    verified: set[str] = set()
     if args.from_dump:
         log(f"loading pre-exported Graph data from {args.from_dump}")
-        sps, apps, tenant_id, dump_domains = load_dump(args.from_dump)
+        sps, apps, tenant_id, verified = load_dump(args.from_dump)
         log(f"loaded {len(sps)} service principals and {len(apps)} applications from dump")
     else:
-        log(f"authenticating to tenant {args.tenant} ...")
+        log(f"authenticating to tenant {args.tenant} ({args.cloud} cloud) ...")
         token = acquire_token(args)
-        log("authenticated; connecting to Microsoft Graph (read-only)")
-        client = GraphClient(token, verbose=args.verbose,
-                             proxy=args.proxy, ca_bundle=args.ca_bundle)
+        token_tid = check_token(token_claims(token), args.tenant)
+        if token_tid:
+            log(f"authenticated to tenant {token_tid}")
+        log("connecting to Microsoft Graph (read-only)")
+        client = GraphClient(token, proxy=args.proxy, ca_bundle=args.ca_bundle,
+                             graph=CLOUDS[args.cloud][1] + "/v1.0")
 
         log("step 1/4: enumerating service principals (enabled apps) ...")
         sps = fetch_service_principals(client)
@@ -1117,10 +1386,22 @@ def main() -> int:
         apps = fetch_applications(client)
         log(f"step 2/4: done - {len(apps)} applications")
 
-        log("step 3/4: reading tenant identity ...")
-        tenant_id = fetch_tenant_id(client)
+        log("step 3/4: reading tenant identity and verified domains ...")
+        tenant_id = fetch_tenant_id(client) or token_tid
         if not tenant_id and GUID_RE.fullmatch(args.tenant):
             tenant_id = args.tenant.lower()
+        # The dump keeps the real verified domains even when --owned-domains
+        # overrides them for this run.
+        if not args.owned_domains or args.save_dump:
+            verified = fetch_verified_domains(client)
+            log(f"step 3/4: done - {len(verified)} verified tenant domains")
+            if verified and not GUID_RE.fullmatch(args.tenant) \
+                    and args.tenant.lower() not in verified:
+                warn(f"--tenant {args.tenant} is not a verified domain of the tenant being "
+                     f"audited ({tenant_id or 'unknown ID'}) - check this is the tenant you meant")
+        if args.save_dump:
+            write_dump(args.save_dump, sps, apps, tenant_id, verified)
+            log(f"raw Graph data saved to {args.save_dump} (re-run offline with --from-dump)")
 
     if not tenant_id:
         log("tenant ID unknown - apps owned by other tenants cannot be told apart, so "
@@ -1129,13 +1410,10 @@ def main() -> int:
     if args.owned_domains:
         owned = {d.strip().lower() for d in args.owned_domains.split(",") if d.strip()}
         log(f"using {len(owned)} owned domain(s) from --owned-domains")
-    elif args.from_dump:
-        owned = dump_domains
-        log(f"using {len(owned)} verified domain(s) from dump")
     else:
-        log("step 3/4: reading verified tenant domains ...")
-        owned = fetch_verified_domains(client)
-        log(f"step 3/4: done - {len(owned)} verified tenant domains")
+        owned = verified
+        if args.from_dump:
+            log(f"using {len(owned)} verified domain(s) from dump")
     if not owned:
         log("no owned/verified domains known - UNVERIFIED_DOMAIN will not be reported "
             "(pass --owned-domains to enable it)")
@@ -1179,7 +1457,7 @@ def main() -> int:
         if accepted:
             print(f"[!] {len(accepted)} app(s) would ACCEPT delivery to a tested URL:")
             for name in accepted:
-                print(f"      - {name}")
+                print(f"      - {console_safe(name)}")
         else:
             print("[+] No app's reply-URL allowlist would accept any tested URL "
                   "(Entra would return AADSTS50011).")
@@ -1189,6 +1467,7 @@ def main() -> int:
         "generatedAt": datetime.now(timezone.utc).isoformat(),
         "tenant": args.tenant,
         "tenantId": tenant_id,
+        "cloud": None if args.from_dump else args.cloud,
         "source": f"dump:{args.from_dump}" if args.from_dump else "graph",
         "servicePrincipalCount": len(sps),
         "applicationCount": len(apps),

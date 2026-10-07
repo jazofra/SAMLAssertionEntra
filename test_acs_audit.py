@@ -4,23 +4,36 @@
     python3 test_acs_audit.py
 """
 
+import base64
 import contextlib
+import csv
 import io
 import json
 import os
 import sys
 import tempfile
+import time
+import types
 
 import acs_audit
 from acs_audit import (
+    GraphError,
     acs_candidate_match,
     build_records,
+    check_token,
+    console_safe,
+    fetch_verified_domains,
     finding_counts,
     flatten,
+    load_dump,
     normalise_for_match,
     print_console,
     resolve_host,
     retry_delay,
+    strip_bearer,
+    token_claims,
+    write_csv,
+    write_dump,
 )
 
 TENANT_ID = "11111111-1111-1111-1111-111111111111"
@@ -373,6 +386,374 @@ def test_end_to_end_dump() -> bool:
     return True
 
 
+def fake_jwt(claims: dict) -> str:
+    def b64(obj):
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).decode().rstrip("=")
+    return f"{b64({'alg': 'none'})}.{b64(claims)}.sig"
+
+
+def run_main(argv: list[str]) -> tuple[int | str | None, str, str]:
+    """Run acs_audit.main() with argv; returns (exit code, stdout, stderr)."""
+    out, err = io.StringIO(), io.StringIO()
+    saved = sys.argv
+    sys.argv = ["acs_audit.py"] + argv
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                rc = acs_audit.main()
+            except SystemExit as exc:
+                rc = exc.code
+    finally:
+        sys.argv = saved
+    return rc, out.getvalue(), err.getvalue()
+
+
+def test_url_classification() -> bool:
+    ok = True
+
+    def codes(url, saml=True):
+        sp = {"id": "sp-c", "appId": "app-c", "displayName": "C", "tags": [],
+              "preferredSingleSignOnMode": "saml" if saml else None, "replyUrls": [url]}
+        recs = build_records([sp], [], OWNED, TENANT_ID, include_all=True)
+        return {f.code for r in recs for u in r.urls for f in u.findings}
+
+    # Cleartext is fine only over loopback; private and link-local traffic
+    # leaves the machine.
+    for url, cleartext in [
+        ("http://localhost:5001/cb", False), ("http://127.0.0.1/cb", False),
+        ("http://[::1]:8080/cb", False), ("http://app.localhost/cb", False),
+        ("http://10.0.0.5/acs", True), ("http://169.254.10.1/acs", True),
+        ("http://192.168.1.10/acs", True),
+    ]:
+        if ("NON_HTTPS" in codes(url)) != cleartext:
+            print(f"FAIL - NON_HTTPS for {url}: expected {cleartext}, codes {codes(url)}")
+            ok = False
+
+    # A trailing dot is the same host: it must not dodge the namespace check
+    # nor trip UNVERIFIED_DOMAIN for an owned domain.
+    got = codes("https://legacy.azurewebsites.net./acs")
+    if "TAKEOVER_PRONE_NAMESPACE" not in got:
+        print(f"FAIL - trailing-dot host escaped TAKEOVER_PRONE_NAMESPACE: {got}")
+        ok = False
+    got = codes("https://sp.contoso.com./acs")
+    if "UNVERIFIED_DOMAIN" in got:
+        print(f"FAIL - trailing-dot owned host reported UNVERIFIED_DOMAIN: {got}")
+        ok = False
+
+    # Public IP literals get their own finding instead of UNVERIFIED_DOMAIN;
+    # private ones stay LOOPBACK_OR_PRIVATE.
+    for url, expected in [
+        ("https://52.10.20.30/saml/acs", {"IP_LITERAL_HOST"}),
+        ("https://[2603:1030:20e::10]/saml/acs", {"IP_LITERAL_HOST"}),
+        ("https://10.0.0.5/saml/acs", {"LOOPBACK_OR_PRIVATE"}),
+    ]:
+        if codes(url) != expected:
+            print(f"FAIL - {url}: expected {expected}, got {codes(url)}")
+            ok = False
+    return ok
+
+
+def test_hostile_directory_data() -> bool:
+    ok = True
+
+    # A wildcard reply URL with many stars once took minutes to match by regex.
+    registered = "https://" + "*a" * 40 + ".contoso.com/x"
+    candidate = "https://" + "a" * 200 + ".example.com/x"
+    start = time.monotonic()
+    result = acs_candidate_match(registered, candidate)
+    if result is not None or time.monotonic() - start > 1:
+        print(f"FAIL - hostile wildcard: result {result!r} after "
+              f"{time.monotonic() - start:.1f}s")
+        ok = False
+
+    # Names and URLs from other tenants must not run as spreadsheet formulas
+    # or terminal escape sequences.
+    sps = [{"id": "sp-h", "appId": "app-h", "displayName": "=HYPERLINK(\"http://x\",\"y\")",
+            "tags": [], "replyUrls": ["https://evil.example/acs"]}]
+    rows = flatten(build_records(sps, [], OWNED, TENANT_ID, include_all=True))
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "out.csv")
+        write_csv(path, rows)
+        with open(path, encoding="utf-8", newline="") as fh:
+            apps = [r["app"] for r in csv.DictReader(fh)]
+    if apps != ["'=HYPERLINK(\"http://x\",\"y\")"]:
+        print(f"FAIL - formula-like display name not neutralised in CSV: {apps}")
+        ok = False
+    shown = console_safe("App\x1b[2J‮evil")
+    if "\x1b" in shown or "‮" in shown or shown != "App\\u001b[2J\\u202eevil":
+        print(f"FAIL - console_safe left control characters: {shown!r}")
+        ok = False
+    return ok
+
+
+def test_token_handling() -> bool:
+    ok = True
+    other = "33333333-3333-3333-3333-333333333333"
+    token = fake_jwt({"tid": TENANT_ID, "exp": time.time() + 3600})
+
+    if token_claims(token).get("tid") != TENANT_ID or token_claims("opaque-token") != {}:
+        print("FAIL - token_claims did not decode a JWT / tolerate an opaque token")
+        ok = False
+    if strip_bearer(f"Bearer {token}\n") != token:
+        print("FAIL - strip_bearer did not remove the Bearer prefix")
+        ok = False
+    if check_token(token_claims(token), "contoso.com") != TENANT_ID \
+            or check_token(token_claims(token), TENANT_ID.upper()) != TENANT_ID:
+        print("FAIL - check_token did not return the token's tenant")
+        ok = False
+    for claims, label in [({"tid": TENANT_ID, "exp": time.time() - 60}, "expired token"),
+                          ({"tid": other}, "token for another tenant")]:
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                check_token(claims, TENANT_ID)
+            print(f"FAIL - check_token accepted an {label}")
+            ok = False
+        except SystemExit:
+            pass
+    return ok
+
+
+def test_credential_selection() -> bool:
+    """Which sign-in acquire_token picks, using a stand-in msal module."""
+    calls = []
+
+    class Confidential:
+        def __init__(self, client_id, authority, client_credential, **kw):
+            calls.append(("confidential", client_id, authority, client_credential))
+
+        def acquire_token_for_client(self, scopes):
+            calls.append(("scopes", scopes))
+            return {"access_token": "app-token"}
+
+    class Public:
+        def __init__(self, client_id, authority, **kw):
+            calls.append(("public", client_id, authority))
+
+        def initiate_device_flow(self, scopes):
+            calls.append(("scopes", scopes))
+            return {"user_code": "X", "message": "sign in"}
+
+        def acquire_token_by_device_flow(self, flow):
+            return {"access_token": "user-token"}
+
+    def args(**kw):
+        base = dict(access_token=None, client_id=None, client_secret=None, client_cert=None,
+                    device_code=False, tenant=TENANT_ID, cloud="global", proxy=None,
+                    ca_bundle=None)
+        base.update(kw)
+        return types.SimpleNamespace(**base)
+
+    ok = True
+    saved_env = {k: os.environ.pop(k, None) for k in ("GRAPH_TOKEN", "AZURE_CLIENT_SECRET")}
+    saved_msal = sys.modules.get("msal")
+    sys.modules["msal"] = types.SimpleNamespace(ConfidentialClientApplication=Confidential,
+                                                PublicClientApplication=Public)
+    try:
+        def pick(env=None, **kw):
+            calls.clear()
+            os.environ.update(env or {})
+            try:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    return acs_audit.acquire_token(args(**kw))
+            finally:
+                for k in env or {}:
+                    os.environ.pop(k, None)
+
+        cases = [
+            # (env, flags, expected token, expected first msal call kind)
+            ({"GRAPH_TOKEN": "env-token"}, {}, "env-token", None),
+            ({"GRAPH_TOKEN": "env-token"}, {"client_id": "cid", "client_secret": "s"},
+             "app-token", "confidential"),
+            ({"GRAPH_TOKEN": "env-token"}, {"device_code": True}, "user-token", "public"),
+            ({"AZURE_CLIENT_SECRET": "env-secret"}, {"client_id": "cid"}, "app-token",
+             "confidential"),
+            ({"AZURE_CLIENT_SECRET": "env-secret"}, {"client_id": "cid", "device_code": True},
+             "user-token", "public"),
+            ({}, {"access_token": "Bearer abc"}, "abc", None),
+        ]
+        for env, flags, want_token, want_kind in cases:
+            got = pick(env, **flags)
+            kind = calls[0][0] if calls else None
+            if got != want_token or kind != want_kind:
+                print(f"FAIL - acquire_token env={env} flags={flags}: got {got!r} via {kind}, "
+                      f"expected {want_token!r} via {want_kind}")
+                ok = False
+
+        pick({"AZURE_CLIENT_SECRET": "env-secret"}, client_id="cid")
+        if calls[0][3] != "env-secret":
+            print(f"FAIL - $AZURE_CLIENT_SECRET was not used as the credential: {calls[0]}")
+            ok = False
+
+        pick(cloud="usgov")
+        if calls[0][2] != f"https://login.microsoftonline.us/{TENANT_ID}" \
+                or calls[1][1] != ["https://graph.microsoft.us/.default"]:
+            print(f"FAIL - --cloud usgov used the wrong sign-in host or scope: {calls}")
+            ok = False
+
+        cert_ok = test_client_certificate(pick, calls)
+    finally:
+        if saved_msal is None:
+            sys.modules.pop("msal", None)
+        else:
+            sys.modules["msal"] = saved_msal
+        for k, v in saved_env.items():
+            if v is not None:
+                os.environ[k] = v
+    return ok and cert_ok
+
+
+def test_client_certificate(pick, calls) -> bool:
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.primitives.serialization import pkcs12
+        from cryptography.x509.oid import NameOID
+    except ImportError:
+        print("SKIP - cryptography not installed; certificate auth not tested")
+        return True
+    import datetime as dt
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "acs-audit-test")])
+    now = dt.datetime.now(dt.timezone.utc)
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+            .public_key(key.public_key()).serial_number(1)
+            .not_valid_before(now).not_valid_after(now + dt.timedelta(days=1))
+            .sign(key, hashes.SHA256()))
+    thumbprint = cert.fingerprint(hashes.SHA1()).hex().upper()
+    cert_pem = cert.public_bytes(serialization.Encoding.PEM)
+
+    def key_pem(password=None):
+        enc = (serialization.BestAvailableEncryption(password) if password
+               else serialization.NoEncryption())
+        return key.private_bytes(serialization.Encoding.PEM,
+                                 serialization.PrivateFormat.PKCS8, enc)
+
+    ok = True
+    with tempfile.TemporaryDirectory() as tmp:
+        files = {
+            "cert-then-key.pem": (cert_pem + key_pem(), None),
+            "key-then-cert.pem": (key_pem() + cert_pem, None),
+            "encrypted.pem": (key_pem(b"pw") + cert_pem, "pw"),
+            "bundle.pfx": (pkcs12.serialize_key_and_certificates(
+                b"t", key, cert, None, serialization.BestAvailableEncryption(b"pw")), "pw"),
+        }
+        for fname, (data, password) in files.items():
+            path = os.path.join(tmp, fname)
+            with open(path, "wb") as fh:
+                fh.write(data)
+            env = {"AZURE_CLIENT_CERTIFICATE_PASSWORD": password} if password else {}
+            pick(env, client_id="cid", client_cert=path)
+            credential = calls[0][3] if calls else None
+            if not isinstance(credential, dict) or credential.get("thumbprint") != thumbprint \
+                    or "BEGIN PRIVATE KEY" not in credential.get("private_key", ""):
+                print(f"FAIL - --client-cert {fname} produced {credential!r}")
+                ok = False
+        try:
+            pick({"AZURE_CLIENT_CERTIFICATE_PASSWORD": "wrong"}, client_id="cid",
+                 client_cert=os.path.join(tmp, "bundle.pfx"))
+            print("FAIL - a wrong PFX password was accepted")
+            ok = False
+        except SystemExit:
+            pass
+    return ok
+
+
+def test_dump_and_domains() -> bool:
+    ok = True
+
+    # A token without Directory.Read.All cannot read /domains: lose the
+    # ownership baseline, keep the run.
+    class Denied:
+        def paged(self, path, params=None, label=None):
+            raise GraphError(403, "Authorization_RequestDenied", path)
+
+    with contextlib.redirect_stderr(io.StringIO()):
+        if fetch_verified_domains(Denied()) != set():
+            print("FAIL - a 403 on /domains was not tolerated")
+            ok = False
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "dump.json")
+        write_dump(path, SPS, APPS, TENANT_ID, OWNED)
+        if load_dump(path) != (SPS, APPS, TENANT_ID, OWNED):
+            print("FAIL - --save-dump output does not load back unchanged")
+            ok = False
+        # A raw Graph page ({"value": [...]}) is accepted for either array.
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"servicePrincipals": {"value": SPS}, "applications": {"value": APPS}}, fh)
+        if load_dump(path)[:2] != (SPS, APPS):
+            print("FAIL - a raw Graph page was not accepted in a dump")
+            ok = False
+    return ok
+
+
+def test_end_to_end_graph() -> bool:
+    """main() against a stand-in Graph: a least-privilege token (no /domains,
+    no /organization) still audits, takes the tenant ID from the token, and
+    --save-dump writes a file --from-dump can read."""
+    seen_roots = []
+
+    class FakeGraph:
+        def __init__(self, token, graph, **kw):
+            self.graph = graph
+            seen_roots.append(graph)
+
+        def paged(self, path, params=None, label=None):
+            if path == "/servicePrincipals":
+                return iter(SPS)
+            if path == "/applications":
+                return iter(APPS)
+            raise GraphError(403, "Authorization_RequestDenied", path)
+
+        def get(self, url, params=None):
+            raise GraphError(403, "Authorization_RequestDenied", url)
+
+    token = fake_jwt({"tid": TENANT_ID, "exp": time.time() + 3600})
+    saved = acs_audit.GraphClient, acs_audit.acquire_token
+    acs_audit.GraphClient = FakeGraph
+    acs_audit.acquire_token = lambda args: token
+    ok = True
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            dump, out_json = os.path.join(tmp, "dump.json"), os.path.join(tmp, "f.json")
+            rc, _, err = run_main(["--tenant", "contoso.com", "--skip-dns", "--cloud", "usgov",
+                                   "--save-dump", dump, "--out-json", out_json])
+            if rc != 0:
+                print(f"FAIL - online run exited {rc}: {err[-500:]}")
+                return False
+            with open(out_json, encoding="utf-8") as fh:
+                report = json.load(fh)
+            codes = {f["code"] for a in report["applications"] for f in a["findings"]}
+            if report["metadata"]["tenantId"] != TENANT_ID or "MULTITENANT_APP" not in codes:
+                print("FAIL - tenant ID was not taken from the token when /organization is denied")
+                ok = False
+            if seen_roots != ["https://graph.microsoft.us/v1.0"]:
+                print(f"FAIL - --cloud usgov did not select the US Gov Graph: {seen_roots}")
+                ok = False
+            if load_dump(dump) != (SPS, APPS, TENANT_ID, set()):
+                print("FAIL - --save-dump did not write the enumerated data")
+                ok = False
+
+            # A token for another tenant than a GUID --tenant must stop the run.
+            other = "33333333-3333-3333-3333-333333333333"
+            rc, _, err = run_main(["--tenant", other, "--skip-dns"])
+            if rc in (0, None) or "refusing to audit" not in str(rc):
+                print(f"FAIL - token/tenant mismatch did not stop the run: {rc!r}")
+                ok = False
+
+            # Output paths are checked before anything runs.
+            rc, _, err = run_main(["--from-dump", dump, "--out-csv",
+                                   os.path.join(tmp, "missing", "f.csv")])
+            if rc != 2 or "directory does not exist" not in err:
+                print(f"FAIL - a missing output directory was not rejected up front: {rc!r}")
+                ok = False
+    finally:
+        acs_audit.GraphClient, acs_audit.acquire_token = saved
+    return ok
+
+
 def main() -> int:
     records = build_records(SPS, APPS, OWNED, TENANT_ID, include_all=False)
     rows = flatten(records)
@@ -422,6 +803,10 @@ def main() -> int:
         return 1
     if not test_end_to_end_dump():
         return 1
+    for test in (test_url_classification, test_hostile_directory_data, test_token_handling,
+                 test_credential_selection, test_dump_and_domains, test_end_to_end_graph):
+        if not test():
+            return 1
 
     print("PASS - all expected detections fired, hardened app is clean")
     print("PASS - injected ACS URL check, wildcard match, and --saml-only behave correctly")
@@ -429,6 +814,8 @@ def main() -> int:
           "end-to-end dump run behave correctly")
     print("PASS - query-string matching, scheme reporting, Verify cert validity and "
           "logout-URL exclusions behave correctly")
+    print("PASS - host classification, hostile directory data, token checks, credential "
+          "selection, dumps and the online Graph path behave correctly")
     return 0
 
 

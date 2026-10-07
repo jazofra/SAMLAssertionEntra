@@ -27,22 +27,50 @@ pip install -r requirements.txt
 # interactive, delegated
 python acs_audit.py --tenant contoso.onmicrosoft.com --device-code -v
 
-# app-only
-python acs_audit.py --tenant <tenant-id> \
-  --client-id <id> --client-secret <secret> \
-  --out-json findings.json --out-csv findings.csv
+# app-only, client secret (from the environment, so it stays out of shell history)
+AZURE_CLIENT_SECRET=<secret> python acs_audit.py --tenant <tenant-id> \
+  --client-id <id> --out-json findings.json --out-csv findings.csv
+
+# app-only, certificate: a PEM holding the private key and certificate (what
+# `az ad sp create-for-rbac --create-cert` writes) or a PFX
+python acs_audit.py --tenant <tenant-id> --client-id <id> --client-cert app.pem
 
 # bring your own token
 GRAPH_TOKEN=eyJ0... python acs_audit.py --tenant <tenant-id>
 
+# GCC High / DoD / China tenants
+python acs_audit.py --tenant <tenant-id> --cloud usgov --device-code
+
 # CI gate
-python acs_audit.py --tenant <tenant-id> --client-id ... --client-secret ... \
+python acs_audit.py --tenant <tenant-id> --client-id ... --client-cert ... \
   --skip-dns --fail-on HIGH
 ```
 
 Required Graph permissions, both read-only: `Application.Read.All`, `Directory.Read.All`.
+`Application.Read.All` alone is enough to run: without `Directory.Read.All` the
+tool cannot read the tenant's verified domains, warns, and reports
+`UNVERIFIED_DOMAIN` only if you pass `--owned-domains`.
 
 The tool issues `GET` requests only. It never writes to the directory.
+
+### Signing in
+
+The first match wins:
+
+1. `--access-token`.
+2. The sign-in the command line names: `--client-cert` or `--client-secret`
+   (app-only), `--device-code` (delegated), or `--client-id` on its own, which
+   is app-only when `$AZURE_CLIENT_SECRET` is set and device code otherwise.
+3. `$GRAPH_TOKEN`. It ranks below the command line so a stale token left in the
+   environment cannot replace the credentials you typed.
+4. Device code with the Microsoft Graph Command Line Tools public client.
+
+A certificate key password is read from `$AZURE_CLIENT_CERTIFICATE_PASSWORD`,
+or prompted for. Before auditing, the tool reads the token's own claims: an
+expired token stops the run, and so does a token issued for a different tenant
+than a GUID `--tenant`. With a domain `--tenant`, it warns when that domain is
+not one of the audited tenant's verified domains. The token's tenant ID is also
+used when the token may not read `/organization`.
 
 ### Answering a specific report: "which of my apps would accept this URL?"
 
@@ -72,9 +100,12 @@ Add `--saml-only` to restrict the whole report to SAML-capable apps.
 
 ### Running offline, without tenant credentials
 
-If you cannot get an app registration or a delegated token, export the two
-Graph collections to a JSON file and analyse them with `--from-dump` — no
-network and no credentials are needed (add `--skip-dns` to stay fully offline).
+Analyse a JSON export of the two Graph collections with `--from-dump`. No
+network and no credentials are needed; add `--skip-dns` to stay fully offline.
+The easiest way to produce one is `--save-dump FILE` on any online run. It
+saves the raw service principals, applications, tenant ID and verified domains
+before analysis starts, so later runs (another `--check-acs-url`, or an analyst
+with no tenant access) need no new sign-in.
 A worked example is in [`examples/sample_dump.json`](examples/sample_dump.json),
 which mirrors a two-SP Shibboleth SAML scenario using fictional hosts:
 
@@ -94,7 +125,9 @@ The dump is a JSON object with two arrays of **raw** Graph objects:
 }
 ```
 
-Export them however you like, for example with the Azure CLI. Follow
+If the tool itself cannot run online, export them however you like, for
+example with the Azure CLI. Each array may also be a raw Graph page
+(`{"value": [...]}`). Follow
 `@odata.nextLink`: Graph returns at most 999 objects per page, and a dump that
 stops at the first page silently leaves the rest of the tenant unaudited.
 
@@ -132,6 +165,9 @@ missing.
 |---|---|
 | `--check-acs-url URL` | Test an injected ACS URL against every app's allowlist; repeatable and comma-separated. Matches are flagged `ACS_URL_ACCEPTED` (CRITICAL) |
 | `--from-dump FILE` | Analyse a pre-exported Graph JSON offline; no tenant, no credentials |
+| `--save-dump FILE` | On an online run, also save the raw Graph data for later `--from-dump` runs |
+| `--client-cert FILE` | App-only sign-in with a certificate (PEM with key and certificate, or PFX); needs `--client-id` |
+| `--cloud NAME` | National cloud: `global` (default; includes GCC Moderate), `usgov` (GCC High), `usgov-dod`, `china` |
 | `--saml-only` | Restrict the report to SAML-capable apps |
 | `--owned-domains a.com,b.com` | Override the ownership baseline; defaults to the tenant's verified domains |
 | `--skip-dns` | Skip resolution (fast pass, or for air-gapped/egress-restricted runs) |
@@ -140,6 +176,7 @@ missing.
 | `--fail-on SEVERITY` | Exit 2 if anything at or above that severity is found |
 | `--proxy URL` | Route sign-in and Graph calls through an HTTP(S) proxy (overrides `HTTPS_PROXY`) |
 | `--ca-bundle PATH` | Trust this CA bundle for sign-in and Graph, for proxies that do TLS inspection (overrides `REQUESTS_CA_BUNDLE`) |
+| `-v`, `--verbose` | Also list every registered host that did not resolve, with its CNAME chain |
 
 Either `--tenant` or `--from-dump` is required.
 
@@ -179,11 +216,12 @@ users, or export the two collections elsewhere and analyse them with
 | `WILDCARD_REPLY_URL` | CRITICAL | Wildcard in the reply URL — the exact-match allowlist no longer constrains delivery. |
 | `CNAME_TO_CLAIMABLE_SERVICE` | HIGH | CNAME chain terminates in a takeover-prone namespace. |
 | `TAKEOVER_PRONE_NAMESPACE` | HIGH | Host itself sits in a claimable namespace (`*.azurewebsites.net`, `*.herokuapp.com`, S3, etc.). |
-| `NON_HTTPS` | HIGH | Assertion or authorization code would traverse cleartext. Loopback is excluded. |
+| `NON_HTTPS` | HIGH | Assertion or authorization code would traverse cleartext. Loopback is excluded; private and link-local addresses are not, since that traffic leaves the machine. |
 | `SAML_UNSIGNED_REQUESTS_ACCEPTED` | MEDIUM | `requestSignatureVerification.isSignedRequestRequired` is not `true`. The allowlist is the only control. |
 | `SIGNING_ENFORCED_NO_VERIFY_CERT` | MEDIUM | Signed requests required but no currently valid `keyCredential` with `usage=Verify`. Expired and not-yet-valid certificates don't count; a missing or unreadable date counts as valid. |
 | `UNVERIFIED_DOMAIN` | MEDIUM / LOW | Host is not under a domain verified in this tenant. Expected for SaaS; confirm the recipient is intended. |
 | `LOOPBACK_OR_PRIVATE` | MEDIUM / LOW | Loopback or RFC1918 host registered. Leftover dev config, and a candidate target when no explicit ACS URL is supplied. |
+| `IP_LITERAL_HOST` | MEDIUM / LOW | Host is a public IP address. Cloud IPs are released and reassigned, and neither DNS nor domain ownership can vouch for one. Reported instead of `UNVERIFIED_DOMAIN`. |
 | `USERINFO_IN_URL` | MEDIUM | URL contains a userinfo component. |
 | `LARGE_REPLY_URL_SURFACE` | LOW | 10+ registered reply/redirect URLs. Each is a permitted delivery target. The logout URL is not counted. |
 | `DISABLED_SP_WITH_URLS` | LOW | Service principal disabled but reply/redirect URLs remain (a logout URL alone does not count). |
@@ -228,3 +266,5 @@ Runs the detection logic against synthetic Graph responses. No tenant or network
 - Only `NXDOMAIN` or a name with no address counts as dangling. Timeouts and server failures are reported as `dns=error` and counted in the progress log, never as `DANGLING_DNS`.
 - IP literals, `localhost`, and single-label names (`https://intranet/...`) are not resolved: public DNS cannot answer for them, so querying would only produce false `DANGLING_DNS` findings.
 - Every app is DNS-checked, including apps with no other finding; an app is dropped from the report only after DNS has run.
+- Display names and reply URLs of apps owned by other tenants are chosen by their publisher, so reports treat them as untrusted. In the CSV, a cell starting with `=`, `+`, `-`, `@`, tab or carriage return gets a leading `'`, so spreadsheet apps do not run it as a formula. On the console, control characters and bidi overrides are shown as `\uXXXX` escapes. Wildcard matching for `--check-acs-url` runs in bounded time, so a reply URL with many `*` cannot stall the run. The JSON output is unmodified.
+- A trailing dot is ignored when classifying a host (`sp.contoso.com.` is `sp.contoso.com`), but not when matching `--check-acs-url`, which compares the URL as registered.
