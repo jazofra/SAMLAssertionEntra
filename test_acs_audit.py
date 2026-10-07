@@ -4,14 +4,23 @@
     python3 test_acs_audit.py
 """
 
+import contextlib
+import io
+import json
+import os
 import sys
+import tempfile
 
+import acs_audit
 from acs_audit import (
     acs_candidate_match,
     build_records,
+    finding_counts,
     flatten,
     normalise_for_match,
     print_console,
+    resolve_host,
+    retry_delay,
 )
 
 TENANT_ID = "11111111-1111-1111-1111-111111111111"
@@ -149,6 +158,132 @@ def test_saml_only() -> bool:
     return True
 
 
+def test_malformed_and_logout_urls() -> bool:
+    ok = True
+
+    # Malformed reply URLs are reported, not fatal - even with ACS candidates,
+    # which normalise every registered URL.
+    sps = [{"id": "sp-x", "appId": "app-x", "displayName": "Broken", "tags": [],
+            "replyUrls": ["http://[::1/acs", "https://h.contoso.com:99999/acs"]}]
+    try:
+        records = build_records(sps, [], OWNED, TENANT_ID, include_all=False,
+                                acs_candidates=["https://attacker.oast.me/saml/acs"])
+    except ValueError as exc:
+        print(f"FAIL - malformed reply URL crashed the run: {exc}")
+        return False
+    codes = {f.code for r in records for u in r.urls for f in u.findings}
+    if "UNPARSEABLE_URL" not in codes:
+        print("FAIL - malformed reply URL was not reported as UNPARSEABLE_URL")
+        ok = False
+
+    # The logout URL never receives an assertion, so it is not an ACS match.
+    apps = [{"id": "a-x", "appId": "app-y", "displayName": "Logout Only",
+             "web": {"redirectUris": [], "logoutUrl": "https://sp.contoso.com/logout"}}]
+    records = build_records([], apps, OWNED, TENANT_ID, include_all=False,
+                            acs_candidates=["https://sp.contoso.com/logout"])
+    if any(f.code.startswith("ACS_URL_ACCEPTED") for r in records for u in r.urls
+           for f in u.findings):
+        print("FAIL - logout URL was reported as an accepted ACS URL")
+        ok = False
+
+    return ok
+
+
+def test_dns_host_selection() -> bool:
+    # None of these can be answered by public DNS; querying them would turn
+    # into a false DANGLING_DNS. resolve_host must skip them without a lookup.
+    for host in ("localhost", "app.localhost", "8.8.8.8", "::1", "10.0.0.5",
+                 "intranet", "*.contoso.com", ""):
+        status, _ = resolve_host(host)
+        if status != "skipped":
+            print(f"FAIL - resolve_host({host!r}) returned {status!r}, expected 'skipped'")
+            return False
+    return True
+
+
+def test_retry_delay() -> bool:
+    class Resp:
+        def __init__(self, headers):
+            self.headers = headers
+
+    cases = [
+        (Resp({"Retry-After": "7"}), 1, 7.0),
+        (Resp({"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"}), 1, 0.0),  # date in the past
+        (Resp({"Retry-After": "99999"}), 1, 120.0),                         # capped
+        (Resp({"Retry-After": "soon"}), 3, 4.0),                            # unparseable -> backoff
+        (None, 6, 30.0),                                                    # transport error
+    ]
+    for resp, attempt, expected in cases:
+        got = retry_delay(resp, attempt)
+        if got != expected:
+            print(f"FAIL - retry_delay({resp and resp.headers}, {attempt}) = {got}, expected {expected}")
+            return False
+    return True
+
+
+def test_include_clean_and_counts() -> bool:
+    ok = True
+    records = build_records(SPS, APPS, OWNED, TENANT_ID, include_all=True)
+    rows = flatten(records)
+    clean_rows = [r for r in rows if r["app"] == "Finance SAML"]
+    if not clean_rows or any(r["severity"] != "CLEAN" for r in clean_rows):
+        print(f"FAIL - --include-clean did not emit CLEAN rows for the clean app: {clean_rows}")
+        ok = False
+
+    # App-level codes count once per app, not once per URL row.
+    unsigned = finding_counts(records)["SAML_UNSIGNED_REQUESTS_ACCEPTED"]
+    if unsigned != 3:
+        print(f"FAIL - SAML_UNSIGNED_REQUESTS_ACCEPTED counted {unsigned} times, expected 3 apps")
+        ok = False
+    return ok
+
+
+def test_end_to_end_dump() -> bool:
+    """main() on a dump: DNS must run before clean apps are dropped, so a
+    hardened app whose only problem is a dangling reply URL is still reported."""
+    dangling = "finance.contoso.com"
+    fake_dns = lambda host, timeout=5.0: (("nxdomain", []) if host == dangling
+                                          else ("resolves", []))
+    with tempfile.TemporaryDirectory() as tmp:
+        dump = os.path.join(tmp, "dump.json")
+        out_json = os.path.join(tmp, "findings.json")
+        out_csv = os.path.join(tmp, "findings.csv")
+        # UTF-16 with BOM, as Windows PowerShell 5.1 `>` redirection writes it.
+        with open(dump, "w", encoding="utf-16") as fh:
+            json.dump({"tenantId": TENANT_ID, "verifiedDomains": sorted(OWNED),
+                       "servicePrincipals": SPS, "applications": APPS}, fh)
+
+        argv = ["acs_audit.py", "--from-dump", dump, "--out-json", out_json,
+                "--out-csv", out_csv, "--fail-on", "CRITICAL"]
+        saved = sys.argv, acs_audit.resolve_host
+        sys.argv, acs_audit.resolve_host = argv, fake_dns
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                rc = acs_audit.main()
+        finally:
+            sys.argv, acs_audit.resolve_host = saved
+
+        with open(out_json, encoding="utf-8") as fh:
+            report = json.load(fh)
+        with open(out_csv, encoding="utf-8") as fh:
+            csv_text = fh.read()
+
+    if rc != 2:
+        print(f"FAIL - --fail-on CRITICAL returned {rc}, expected 2")
+        return False
+    finance = [a for a in report["applications"] if a["display_name"] == "Finance SAML"]
+    if not finance or finance[0]["severity"] != "CRITICAL" or not any(
+        f["code"] == "DANGLING_DNS" for u in finance[0]["urls"] for f in u["findings"]
+    ):
+        print("FAIL - dangling reply URL on an otherwise clean app was not reported")
+        return False
+    if "Finance SAML" not in csv_text or not csv_text.startswith("severity,app,appId"):
+        print("FAIL - CSV output missing the dangling-DNS row or its header")
+        return False
+    return True
+
+
 def main() -> int:
     records = build_records(SPS, APPS, OWNED, TENANT_ID, include_all=False)
     rows = flatten(records)
@@ -186,9 +321,21 @@ def main() -> int:
         return 1
     if not test_saml_only():
         return 1
+    if not test_malformed_and_logout_urls():
+        return 1
+    if not test_dns_host_selection():
+        return 1
+    if not test_retry_delay():
+        return 1
+    if not test_include_clean_and_counts():
+        return 1
+    if not test_end_to_end_dump():
+        return 1
 
     print("PASS - all expected detections fired, hardened app is clean")
     print("PASS - injected ACS URL check, wildcard match, and --saml-only behave correctly")
+    print("PASS - malformed URLs, DNS host selection, retry delays, --include-clean and "
+          "end-to-end dump run behave correctly")
     return 0
 
 
