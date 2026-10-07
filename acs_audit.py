@@ -346,7 +346,8 @@ class AppRecord:
     account_enabled: bool | None = None
     is_foreign_tenant: bool = False
     signed_requests_required: bool | None = None
-    verify_certs: int = 0
+    verify_certs: int = 0  # usage=Verify keyCredentials valid right now
+    invalid_verify_certs: int = 0  # usage=Verify keyCredentials expired or not yet valid
     tags: list[str] = field(default_factory=list)
     urls: list[UrlRecord] = field(default_factory=list)
     findings: list[Finding] = field(default_factory=list)
@@ -476,13 +477,15 @@ def registrable_match(host: str, owned: set[str]) -> bool:
     return any(host == d or host.endswith("." + d) for d in owned)
 
 
-def normalise_for_match(raw: str) -> str:
-    """Canonical (scheme://host:port/path) form used to compare a candidate ACS
-    URL against a registered reply URL. Host is lowercased and the default port
-    for the scheme is filled in, mirroring how Entra normalises before its
-    exact-match reply-URL check. Path is left byte-for-byte: Entra treats the
-    path as case-sensitive. A URL that cannot be parsed (bad IPv6 literal, port
-    out of range) is returned stripped, so it can still match itself."""
+def normalise_for_match(raw: str, keep_query: bool = True) -> str:
+    """Canonical (scheme://host:port/path?query) form used to compare a candidate
+    ACS URL against a registered reply URL. Host is lowercased and the default
+    port for the scheme is filled in, mirroring how Entra normalises before its
+    exact-match reply-URL check. Path, query and fragment are left byte-for-byte:
+    Entra compares them case-sensitively, and `/acs?a=1` is a different reply URL
+    from `/acs`. keep_query=False drops query and fragment; only the permissive
+    wildcard comparison uses that. A URL that cannot be parsed (bad IPv6 literal,
+    port out of range) is returned stripped, so it can still match itself."""
     try:
         parts = urlsplit(raw)
         port = parts.port
@@ -493,6 +496,11 @@ def normalise_for_match(raw: str) -> str:
     if port is None:
         port = {"https": 443, "http": 80}.get(scheme)
     path = parts.path or "/"
+    if keep_query:
+        if parts.query:
+            path += "?" + parts.query
+        if parts.fragment:
+            path += "#" + parts.fragment
     return f"{scheme}://{host}:{port}{path}"
 
 
@@ -506,9 +514,16 @@ def acs_candidate_match(registered: str, candidate: str) -> str | None:
     norm_registered = normalise_for_match(registered)
     norm_candidate = normalise_for_match(candidate)
     if "*" in registered:
-        # Compare raw against raw and canonical against canonical, so neither a
-        # default port nor host casing hides a match.
-        for pattern, target in ((registered, candidate), (norm_registered, norm_candidate)):
+        # Compare raw against raw, canonical against canonical, and canonical
+        # without the query, so neither a default port, host casing nor an
+        # appended query string hides a match.
+        comparisons = (
+            (registered, candidate),
+            (norm_registered, norm_candidate),
+            (normalise_for_match(registered, keep_query=False),
+             normalise_for_match(candidate, keep_query=False)),
+        )
+        for pattern, target in comparisons:
             if re.fullmatch(re.escape(pattern).replace(r"\*", ".*"), target):
                 return "wildcard"
     if registered == candidate or norm_registered == norm_candidate:
@@ -550,6 +565,9 @@ def analyse_url(
 ) -> None:
     raw = rec.url
     loopback = is_loopback_name(rec.host) or is_private_host(rec.host)
+    # parse_url already reported it; its scheme is empty only because parsing
+    # failed, so judging the scheme would just add noise.
+    unparseable = any(f.code == "UNPARSEABLE_URL" for f in rec.findings)
 
     # If the operator supplied the ACS URL(s) an attacker would try to inject
     # (e.g. the one from a bug-bounty report), flag every app whose allowlist
@@ -585,11 +603,12 @@ def analyse_url(
             Finding("HIGH", "NON_HTTPS",
                     "Assertion or authorization code would traverse cleartext")
         )
-    elif rec.scheme not in ("https", "http") and not raw.lower().startswith(
+    elif not unparseable and rec.scheme not in ("https", "http") and not raw.lower().startswith(
         BENIGN_NATIVE_SCHEME_PREFIXES
     ):
         rec.findings.append(
-            Finding("LOW", "UNUSUAL_SCHEME", f"Non-HTTPS scheme '{rec.scheme}'")
+            Finding("LOW", "UNUSUAL_SCHEME",
+                    f"Non-HTTPS scheme '{rec.scheme}'" if rec.scheme else "URL has no scheme")
         )
 
     if loopback:
@@ -752,6 +771,30 @@ def run_dns_checks(apps: list[AppRecord], workers: int, verbose: bool) -> None:
 # ---------------------------------------------------------------------------
 # Correlation and app-level analysis
 # ---------------------------------------------------------------------------
+def parse_graph_datetime(value: Any) -> datetime | None:
+    """Parse a Graph DateTimeOffset ("2027-01-01T00:00:00Z", sometimes with up
+    to 7 fractional digits) to an aware datetime. None if absent or unreadable."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = re.sub(r"[zZ]$", "+00:00", value.strip())
+    # Older Pythons' fromisoformat only takes exactly 3 or 6 fractional digits.
+    text = re.sub(r"\.(\d+)", lambda m: "." + (m.group(1) + "000000")[:6], text)
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def credential_valid_at(cred: dict, now: datetime) -> bool:
+    """True when the keyCredential's validity window contains `now`. A missing
+    or unreadable date counts as open-ended, so a malformed export never invents
+    an expired-certificate finding."""
+    start = parse_graph_datetime(cred.get("startDateTime"))
+    end = parse_graph_datetime(cred.get("endDateTime"))
+    return (start is None or start <= now) and (end is None or now < end)
+
+
 def build_records(
     sps: list[dict],
     apps: list[dict],
@@ -762,6 +805,7 @@ def build_records(
     saml_only: bool = False,
 ) -> list[AppRecord]:
     by_app_id: dict[str, AppRecord] = {}
+    now = datetime.now(timezone.utc)
 
     for sp in sps:
         app_id = sp.get("appId")
@@ -801,9 +845,10 @@ def build_records(
         rsv = app.get("requestSignatureVerification")
         if isinstance(rsv, dict):
             rec.signed_requests_required = rsv.get("isSignedRequestRequired")
-        rec.verify_certs = sum(
-            1 for k in (app.get("keyCredentials") or []) if (k.get("usage") or "").lower() == "verify"
-        )
+        verify = [k for k in (app.get("keyCredentials") or [])
+                  if (k.get("usage") or "").lower() == "verify"]
+        rec.verify_certs = sum(1 for k in verify if credential_valid_at(k, now))
+        rec.invalid_verify_certs = len(verify) - rec.verify_certs
 
         seen = {u.url for u in rec.urls}
         for key, source in (("web", "app.web"), ("spa", "app.spa"), ("publicClient", "app.publicClient")):
@@ -834,19 +879,25 @@ def build_records(
                             "registered reply URL, so the allowlist is the only control.")
                 )
             if rec.signed_requests_required is True and rec.verify_certs == 0:
-                rec.findings.append(
-                    Finding("MEDIUM", "SIGNING_ENFORCED_NO_VERIFY_CERT",
-                            "Signed requests required but no keyCredential with usage=Verify")
-                )
+                if rec.invalid_verify_certs:
+                    detail = (f"Signed requests required but none of the "
+                              f"{rec.invalid_verify_certs} keyCredential(s) with usage=Verify is "
+                              "currently valid (expired or not yet valid)")
+                else:
+                    detail = "Signed requests required but no keyCredential with usage=Verify"
+                rec.findings.append(Finding("MEDIUM", "SIGNING_ENFORCED_NO_VERIFY_CERT", detail))
 
-        if len(rec.urls) >= 10:
+        # The logout URL never receives an assertion or code, so it is not part
+        # of the delivery surface these two checks are about.
+        delivery_urls = [u for u in rec.urls if u.source != LOGOUT_SOURCE]
+        if len(delivery_urls) >= 10:
             rec.findings.append(
                 Finding("LOW", "LARGE_REPLY_URL_SURFACE",
-                        f"{len(rec.urls)} registered URLs - each one is a permitted delivery "
-                        "target; prune anything unused")
+                        f"{len(delivery_urls)} registered reply/redirect URLs - each one is a "
+                        "permitted delivery target; prune anything unused")
             )
 
-        if rec.account_enabled is False and rec.urls:
+        if rec.account_enabled is False and delivery_urls:
             rec.findings.append(
                 Finding("LOW", "DISABLED_SP_WITH_URLS",
                         "Service principal disabled but reply URLs remain registered")

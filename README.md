@@ -57,6 +57,11 @@ flagged `ACS_URL_ACCEPTED` (CRITICAL); if nothing matches, Entra would return
 `AADSTS50011` and the tool says so. Logout URLs are not tested: Entra never
 sends an assertion there.
 
+Matching ignores host casing and a default port (`:443` / `:80`), but compares
+the path and query string exactly and case-sensitively: `/acs` and `/acs?x=1`
+are different reply URLs. A wildcard reply URL is matched permissively — `*`
+covers any characters, and a query appended to the tested URL does not escape it.
+
 ```bash
 python acs_audit.py --tenant <tenant-id> --device-code \
   --check-acs-url "https://attacker.oast.me/saml/acs" \
@@ -176,12 +181,14 @@ users, or export the two collections elsewhere and analyse them with
 | `TAKEOVER_PRONE_NAMESPACE` | HIGH | Host itself sits in a claimable namespace (`*.azurewebsites.net`, `*.herokuapp.com`, S3, etc.). |
 | `NON_HTTPS` | HIGH | Assertion or authorization code would traverse cleartext. Loopback is excluded. |
 | `SAML_UNSIGNED_REQUESTS_ACCEPTED` | MEDIUM | `requestSignatureVerification.isSignedRequestRequired` is not `true`. The allowlist is the only control. |
-| `SIGNING_ENFORCED_NO_VERIFY_CERT` | MEDIUM | Signed requests required but no `keyCredential` with `usage=Verify`. |
+| `SIGNING_ENFORCED_NO_VERIFY_CERT` | MEDIUM | Signed requests required but no currently valid `keyCredential` with `usage=Verify`. Expired and not-yet-valid certificates don't count; a missing or unreadable date counts as valid. |
 | `UNVERIFIED_DOMAIN` | MEDIUM / LOW | Host is not under a domain verified in this tenant. Expected for SaaS; confirm the recipient is intended. |
 | `LOOPBACK_OR_PRIVATE` | MEDIUM / LOW | Loopback or RFC1918 host registered. Leftover dev config, and a candidate target when no explicit ACS URL is supplied. |
 | `USERINFO_IN_URL` | MEDIUM | URL contains a userinfo component. |
-| `LARGE_REPLY_URL_SURFACE` | LOW | 10+ registered URLs. Each is a permitted delivery target. |
-| `DISABLED_SP_WITH_URLS` | LOW | Service principal disabled but reply URLs remain. |
+| `LARGE_REPLY_URL_SURFACE` | LOW | 10+ registered reply/redirect URLs. Each is a permitted delivery target. The logout URL is not counted. |
+| `DISABLED_SP_WITH_URLS` | LOW | Service principal disabled but reply/redirect URLs remain (a logout URL alone does not count). |
+| `UNUSUAL_SCHEME` | LOW | Scheme is neither http nor https, or missing, and is not a known native/broker scheme (`ms-appx-web`, `msauth`, `msal`, `urn:ietf:wg:oauth`). |
+| `UNPARSEABLE_URL` | LOW | URL cannot be parsed (e.g. broken IPv6 literal, port out of range). Reported once, without further URL checks that need a parsed scheme. |
 | `MULTITENANT_APP` | INFO | App owned by another tenant; hygiene is the vendor's responsibility. |
 
 `DANGLING_DNS` and `WILDCARD_REPLY_URL` are the two that mean *act today*. `SAML_UNSIGNED_REQUESTS_ACCEPTED` on its own will fire across most of the estate — treat it as a hardening backlog, not an incident.

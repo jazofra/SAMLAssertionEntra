@@ -113,6 +113,23 @@ def test_match_helpers() -> bool:
         print("FAIL - normalise_for_match did not canonicalise host/port/path")
         ok = False
 
+    # The query string is part of the exact match: /acs and /acs?x=1 are
+    # different reply URLs, in either direction.
+    query_cases = [
+        ("https://sp.contoso.com/acs", "https://sp.contoso.com/acs?x=1", None),
+        ("https://sp.contoso.com/acs?x=1", "https://sp.contoso.com/acs", None),
+        ("https://sp.contoso.com/acs?x=1", "https://SP.contoso.com:443/acs?x=1", "exact"),
+        ("https://sp.contoso.com/acs?x=1", "https://sp.contoso.com/acs?X=1", None),
+        # A wildcard stays permissive: an appended query does not escape it.
+        ("https://*.dev.contoso.com/saml/acs", "https://a.dev.contoso.com/saml/acs?x=1", "wildcard"),
+    ]
+    for registered, candidate, expected in query_cases:
+        got = acs_candidate_match(registered, candidate)
+        if got != expected:
+            print(f"FAIL - acs_candidate_match({registered!r}, {candidate!r}) = {got!r}, "
+                  f"expected {expected!r}")
+            ok = False
+
     return ok
 
 
@@ -184,6 +201,78 @@ def test_malformed_and_logout_urls() -> bool:
     if any(f.code.startswith("ACS_URL_ACCEPTED") for r in records for u in r.urls
            for f in u.findings):
         print("FAIL - logout URL was reported as an accepted ACS URL")
+        ok = False
+
+    return ok
+
+
+def test_rule_refinements() -> bool:
+    ok = True
+
+    def url_codes(records, url):
+        return {f.code for r in records for u in r.urls if u.url == url for f in u.findings}
+
+    # An unparseable URL is reported once, not also as UNUSUAL_SCHEME; a URL
+    # that parses but has no scheme says so.
+    sps = [{"id": "sp-u", "appId": "app-u", "displayName": "Odd URLs", "tags": [],
+            "replyUrls": ["http://[::1/acs", "sp.contoso.com/acs"]}]
+    records = build_records(sps, [], OWNED, TENANT_ID, include_all=True)
+    if url_codes(records, "http://[::1/acs") != {"UNPARSEABLE_URL"}:
+        print(f"FAIL - unparseable URL codes: {url_codes(records, 'http://[::1/acs')}")
+        ok = False
+    details = [f.detail for r in records for u in r.urls if u.url == "sp.contoso.com/acs"
+               for f in u.findings if f.code == "UNUSUAL_SCHEME"]
+    if details != ["URL has no scheme"]:
+        print(f"FAIL - scheme-less URL not reported as such: {details}")
+        ok = False
+
+    # Signed requests required: only a currently valid Verify cert counts.
+    def signing_codes(key_credentials):
+        sp = {"id": "sp-s", "appId": "app-s", "displayName": "Signed", "tags": [],
+              "preferredSingleSignOnMode": "saml", "replyUrls": ["https://s.contoso.com/acs"]}
+        app = {"id": "a-s", "appId": "app-s",
+               "requestSignatureVerification": {"isSignedRequestRequired": True},
+               "keyCredentials": key_credentials}
+        recs = build_records([sp], [app], OWNED, TENANT_ID, include_all=True)
+        return {f.code for r in recs for f in r.findings}
+
+    cert_cases = [
+        ([{"usage": "Verify", "endDateTime": "2020-01-01T00:00:00Z"}], True),           # expired
+        ([{"usage": "Verify", "startDateTime": "2999-01-01T00:00:00Z"}], True),         # not yet valid
+        ([{"usage": "Verify", "endDateTime": "2999-01-01T00:00:00.1234567Z"}], False),  # valid, 7 digits
+        ([{"usage": "Verify", "endDateTime": "not a date"}], False),                    # unreadable
+        ([{"usage": "Verify", "endDateTime": "2020-01-01T00:00:00Z"},
+          {"usage": "Verify", "endDateTime": "2999-01-01T00:00:00Z"}], False),          # one still valid
+        ([{"usage": "Sign", "endDateTime": "2999-01-01T00:00:00Z"}], True),             # wrong usage
+    ]
+    for creds, should_fire in cert_cases:
+        fired = "SIGNING_ENFORCED_NO_VERIFY_CERT" in signing_codes(creds)
+        if fired != should_fire:
+            print(f"FAIL - SIGNING_ENFORCED_NO_VERIFY_CERT fired={fired} for {creds}")
+            ok = False
+
+    # The logout URL counts towards neither the URL-surface threshold nor the
+    # "disabled SP still has reply URLs" check.
+    def app_codes(redirect_count, enabled=True):
+        sp = {"id": "sp-l", "appId": "app-l", "displayName": "Logout", "tags": [],
+              "accountEnabled": enabled, "replyUrls": []}
+        app = {"id": "a-l", "appId": "app-l", "web": {
+            "redirectUris": [f"https://r{i}.contoso.com/cb" for i in range(redirect_count)],
+            "logoutUrl": "https://sp.contoso.com/logout"}}
+        recs = build_records([sp], [app], OWNED, TENANT_ID, include_all=True)
+        return {f.code for r in recs for f in r.findings}
+
+    if "LARGE_REPLY_URL_SURFACE" in app_codes(9):
+        print("FAIL - 9 redirect URIs plus a logout URL tripped LARGE_REPLY_URL_SURFACE")
+        ok = False
+    if "LARGE_REPLY_URL_SURFACE" not in app_codes(10):
+        print("FAIL - 10 redirect URIs did not trip LARGE_REPLY_URL_SURFACE")
+        ok = False
+    if "DISABLED_SP_WITH_URLS" in app_codes(0, enabled=False):
+        print("FAIL - disabled SP with only a logout URL reported DISABLED_SP_WITH_URLS")
+        ok = False
+    if "DISABLED_SP_WITH_URLS" not in app_codes(1, enabled=False):
+        print("FAIL - disabled SP with a redirect URI did not report DISABLED_SP_WITH_URLS")
         ok = False
 
     return ok
@@ -323,6 +412,8 @@ def main() -> int:
         return 1
     if not test_malformed_and_logout_urls():
         return 1
+    if not test_rule_refinements():
+        return 1
     if not test_dns_host_selection():
         return 1
     if not test_retry_delay():
@@ -336,6 +427,8 @@ def main() -> int:
     print("PASS - injected ACS URL check, wildcard match, and --saml-only behave correctly")
     print("PASS - malformed URLs, DNS host selection, retry delays, --include-clean and "
           "end-to-end dump run behave correctly")
+    print("PASS - query-string matching, scheme reporting, Verify cert validity and "
+          "logout-URL exclusions behave correctly")
     return 0
 
 
